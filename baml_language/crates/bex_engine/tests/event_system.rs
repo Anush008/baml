@@ -51,6 +51,10 @@ fn summarize_events(events: &[RuntimeEvent]) -> Vec<String> {
             EventKind::SetTags(_) => "tags".to_string(),
             EventKind::Custom(c) => format!("custom:{}", c.name),
             EventKind::Log(l) => format!("log:{}:{:?}", l.level, l.data),
+            EventKind::LLMUsage(u) => format!(
+                "llm_usage:{:?}:{:?}:{:?}",
+                u.input_tokens, u.output_tokens, u.cached_input_tokens
+            ),
         })
         .collect()
 }

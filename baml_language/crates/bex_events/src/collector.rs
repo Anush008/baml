@@ -185,11 +185,11 @@ impl FunctionLog {
         let mut result = None;
         let mut timing = Timing::default();
         let mut tags: HashMap<String, String> = HashMap::new();
-        // TODO: Aggregate usage from child LLMCall spans once usage events are implemented.
-        let usage = Usage::default();
+        let mut usage = Usage::default();
         let mut child_starts: HashMap<SpanId, ChildSpan> = HashMap::new();
         let mut calls: Vec<LLMCall> = vec![];
         let mut log_events: Vec<LogEvent> = vec![];
+        let mut child_usage: HashMap<SpanId, Usage> = HashMap::new();
 
         for event in events {
             let is_root = event.ctx.span_id == engine_span_id;
@@ -235,8 +235,20 @@ impl FunctionLog {
                                     i64::try_from(end.duration.as_millis()).unwrap_or(i64::MAX),
                                 ),
                             },
-                            usage: Usage::default(), // Deferred: requires usage events
+                            usage: child_usage.remove(&event.ctx.span_id).unwrap_or_default(),
                         });
+                    }
+                }
+                EventKind::LLMUsage(llm_usage) => {
+                    let u = Usage {
+                        input_tokens: llm_usage.input_tokens,
+                        output_tokens: llm_usage.output_tokens,
+                        cached_input_tokens: llm_usage.cached_input_tokens,
+                    };
+                    if is_root {
+                        usage = usage.add(&u);
+                    } else {
+                        child_usage.insert(event.ctx.span_id.clone(), u);
                     }
                 }
                 EventKind::SetTags(tag_list) => {
@@ -327,7 +339,7 @@ mod tests {
     use web_time::SystemTime;
 
     use super::*;
-    use crate::{FunctionEnd, FunctionStart, SpanContext};
+    use crate::{FunctionEnd, FunctionStart, LLMUsageEvent, SpanContext};
 
     fn make_start_event(
         span_id: SpanId,
@@ -705,6 +717,126 @@ mod tests {
         // Drop c2 — ref count goes to 0, events freed
         drop(c2);
         assert!(event_store::events_for_span(&root).is_none());
+    }
+
+    fn make_llm_usage_event(
+        span_id: SpanId,
+        root_span_id: SpanId,
+        parent: Option<SpanId>,
+        input_tokens: Option<i64>,
+        output_tokens: Option<i64>,
+        cached_input_tokens: Option<i64>,
+    ) -> RuntimeEvent {
+        RuntimeEvent {
+            ctx: SpanContext {
+                span_id,
+                parent_span_id: parent,
+                root_span_id,
+            },
+            call_stack: vec![],
+            timestamp: SystemTime::now(),
+            event: EventKind::LLMUsage(LLMUsageEvent {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+            }),
+        }
+    }
+
+    #[test]
+    fn llm_usage_event_wired_into_collector_usage() {
+        let collector = Collector::new("test".into());
+        let root = SpanId::new();
+        collector.track(&root);
+
+        event_store::emit(&make_start_event(
+            root.clone(),
+            root.clone(),
+            None,
+            "my_func",
+            vec![],
+            vec![],
+        ));
+        // Emit usage on the root span itself
+        event_store::emit(&make_llm_usage_event(
+            root.clone(),
+            root.clone(),
+            None,
+            Some(100),
+            Some(50),
+            Some(10),
+        ));
+        event_store::emit(&make_end_event(
+            root.clone(),
+            root.clone(),
+            None,
+            "my_func",
+            BexExternalValue::Null,
+            Duration::from_millis(200),
+        ));
+
+        let usage = collector.usage();
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(50));
+        assert_eq!(usage.cached_input_tokens, Some(10));
+    }
+
+    #[test]
+    fn llm_usage_event_wired_into_llm_call() {
+        let collector = Collector::new("test".into());
+        let root = SpanId::new();
+        let child = SpanId::new();
+        collector.track(&root);
+
+        event_store::emit(&make_start_event(
+            root.clone(),
+            root.clone(),
+            None,
+            "pipeline",
+            vec![],
+            vec![],
+        ));
+        event_store::emit(&make_start_event(
+            child.clone(),
+            root.clone(),
+            Some(root.clone()),
+            "llm_call",
+            vec![],
+            vec![],
+        ));
+        // Emit usage on the child span
+        event_store::emit(&make_llm_usage_event(
+            child.clone(),
+            root.clone(),
+            Some(root.clone()),
+            Some(200),
+            Some(75),
+            None,
+        ));
+        event_store::emit(&make_end_event(
+            child.clone(),
+            root.clone(),
+            Some(root.clone()),
+            "llm_call",
+            BexExternalValue::Null,
+            Duration::from_millis(80),
+        ));
+        event_store::emit(&make_end_event(
+            root.clone(),
+            root.clone(),
+            None,
+            "pipeline",
+            BexExternalValue::Null,
+            Duration::from_millis(300),
+        ));
+
+        let logs = collector.logs();
+        assert_eq!(logs.len(), 1);
+        let log = &logs[0];
+        assert_eq!(log.calls.len(), 1);
+        assert_eq!(log.calls[0].usage.input_tokens, Some(200));
+        assert_eq!(log.calls[0].usage.output_tokens, Some(75));
+        assert_eq!(log.calls[0].usage.cached_input_tokens, None);
     }
 
     #[test]

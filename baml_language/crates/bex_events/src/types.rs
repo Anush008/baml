@@ -29,6 +29,8 @@ pub enum EventKind {
     Log(LogEvent),
     /// A custom user-defined event emitted via `baml.events.send()`.
     Custom(CustomEvent),
+    /// Token usage from an LLM call.
+    LLMUsage(LLMUsageEvent),
 }
 
 /// Source location for a log or custom event.
@@ -64,6 +66,14 @@ pub struct CustomEvent {
     pub name: String,
     /// Event payload
     pub data: BexExternalValue,
+}
+
+/// Token usage event emitted after an LLM response is parsed.
+#[derive(Clone, Debug)]
+pub struct LLMUsageEvent {
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
 }
 
 /// Function lifecycle events.

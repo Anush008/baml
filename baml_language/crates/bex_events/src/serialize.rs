@@ -302,6 +302,16 @@ fn event_content_to_json(event: &EventKind) -> serde_json::Value {
                 }
             })
         }
+        EventKind::LLMUsage(llm_usage) => {
+            serde_json::json!({
+                "type": "llm_usage",
+                "data": {
+                    "input_tokens": llm_usage.input_tokens,
+                    "output_tokens": llm_usage.output_tokens,
+                    "cached_input_tokens": llm_usage.cached_input_tokens,
+                }
+            })
+        }
     }
 }
 

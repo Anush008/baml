@@ -108,6 +108,19 @@ fn event_kind_to_proto(
                 data: Some(data_proto),
             })
         }
+        // LLMUsage is a local aggregation hint for Collector::from_events.
+        // The wire format doesn't need a dedicated variant; surface it as a
+        // Custom event with a stable name and an encoded token summary.
+        EventKind::LLMUsage(u) => {
+            let summary = format!(
+                "input={:?};output={:?};cached={:?}",
+                u.input_tokens, u.output_tokens, u.cached_input_tokens
+            );
+            ProtoEventKindVariant::Custom(cffi::CustomEvent {
+                name: format!("_llm_usage:{summary}"),
+                data: None,
+            })
+        }
     };
 
     Ok(ProtoEventKind { kind: Some(kind) })
