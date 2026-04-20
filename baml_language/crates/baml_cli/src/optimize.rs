@@ -2,7 +2,10 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use baml_optimize::discover_all_tests;
+use baml_project::ProjectDatabase;
+use baml_workspace::discover_baml_files;
 use clap::Args;
 
 #[derive(Args, Clone, Debug)]
@@ -26,11 +29,40 @@ pub struct OptimizeArgs {
 
 impl OptimizeArgs {
     pub fn run(&self) -> Result<crate::ExitCode> {
-        println!("Optimizing function: {}", self.function);
-        println!("From: {}", self.from.display());
-        println!("Max iterations: {}", self.max_iterations);
-        println!("Parallel: {}", self.parallel);
-        println!("\nOptimization not yet implemented - skeleton only.");
+        let from = std::fs::canonicalize(&self.from)
+            .with_context(|| format!("Could not resolve path: {}", self.from.display()))?;
+
+        // Set up compiler database
+        let mut db = ProjectDatabase::new();
+        let _project = db.set_project_root(&from);
+
+        let baml_files = discover_baml_files(&from);
+        if baml_files.is_empty() {
+            eprintln!("No .baml files found in {}", from.display());
+            return Ok(crate::ExitCode::Other);
+        }
+
+        for file_path in &baml_files {
+            let content = std::fs::read_to_string(file_path)
+                .with_context(|| format!("Failed to read {}", file_path.display()))?;
+            db.add_or_update_file(file_path, &content);
+        }
+
+        // Discover tests for the target function
+        let filter = vec![self.function.clone()];
+        let tests = discover_all_tests(&db, &filter);
+
+        if tests.is_empty() {
+            eprintln!("No tests found for function: {}", self.function);
+            return Ok(crate::ExitCode::Other);
+        }
+
+        println!("Found {} tests for function '{}':", tests.len(), self.function);
+        for test in &tests {
+            println!("  {}::{}", test.function_name, test.test_name);
+        }
+
+        println!("\nOptimization loop not yet implemented.");
         Ok(crate::ExitCode::Success)
     }
 }
