@@ -71,3 +71,56 @@ pub struct Candidate {
     pub scores: Option<CandidateScores>,
     pub rationale: Option<String>,
 }
+
+/// A single test execution packaged for the reflection model: inputs, the
+/// LLM's generated output, and feedback about why it passed or failed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReflectiveExample {
+    pub inputs: HashMap<String, String>,
+    pub generated_outputs: HashMap<String, String>,
+    pub feedback: String,
+    pub failure_location: Option<String>,
+    pub test_source: Option<String>,
+    pub test_name: Option<String>,
+    pub prompt_tokens: Option<f64>,
+    pub completion_tokens: Option<f64>,
+    pub latency_ms: Option<f64>,
+}
+
+/// Collection of optimization objectives passed to the reflection function.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OptimizationObjectives {
+    pub objectives: Vec<ObjectiveStatus>,
+}
+
+/// Status of a single optimization objective (e.g. accuracy, tokens, latency).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ObjectiveStatus {
+    pub name: String,
+    pub weight: f64,
+    /// `"maximize"` or `"minimize"`.
+    pub direction: String,
+    pub current_value: f64,
+    pub status: String,
+}
+
+/// Current scalar metrics for the candidate being improved.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CurrentMetrics {
+    pub test_pass_rate: f64,
+    pub tests_passed: i64,
+    pub tests_total: i64,
+    pub avg_prompt_tokens: f64,
+    pub avg_completion_tokens: f64,
+    pub avg_total_tokens: f64,
+    pub avg_latency_ms: f64,
+}
+
+/// The result of a reflection call: an improved prompt and schema.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImprovedFunction {
+    pub prompt_text: String,
+    pub classes: Vec<ClassDefinition>,
+    pub enums: Vec<EnumDefinition>,
+    pub rationale: String,
+}

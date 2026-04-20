@@ -1398,12 +1398,15 @@ dependencies = [
  "baml_workspace",
  "bex_engine",
  "bex_events",
+ "bex_project",
  "bex_vm_types",
  "serde",
  "serde_json",
  "sys_native",
  "sys_ops",
+ "tempfile",
  "tokio",
+ "vfs",
  "walkdir",
 ]
 
