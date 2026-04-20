@@ -72,6 +72,10 @@ pub(crate) enum Commands {
     #[command(about = "Run a BAML function or script", disable_help_flag = true)]
     Run(crate::run_command::RunArgs),
 
+    #[command(about = "Optimize prompts using GEPA algorithm")]
+    Optimize(crate::optimize::OptimizeArgs),
+
+
     #[command(about = "Starts a language server", name = "lsp")]
     LanguageServer(crate::lsp::LanguageServerArgs),
     // #[command(about = "Start an interactive REPL for BAML expressions", hide = true)]
@@ -129,6 +133,7 @@ impl RuntimeCli {
             Commands::Generate(args) => args.run(),
             Commands::Grep(args) => args.run(),
             Commands::Test(args) => args.run(),
+            Commands::Optimize(args) => args.run(),
             Commands::LanguageServer(args) => match args.run() {
                 Ok(()) => Ok(crate::ExitCode::Success),
                 Err(e) => {

@@ -1,0 +1,25 @@
+[package]
+name = "baml_optimize"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+baml_db = { workspace = true }
+baml_project = { workspace = true }
+baml_workspace = { workspace = true }
+bex_engine = { workspace = true }
+bex_events = { workspace = true }
+bex_vm_types = { workspace = true }
+sys_native = { workspace = true }
+sys_ops = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+walkdir = { workspace = true }

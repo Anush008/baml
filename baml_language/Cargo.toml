@@ -80,6 +80,7 @@ minijinja = { git = "https://github.com/boundaryml/minijinja.git", branch = "val
 ] }
 minijinja-contrib = { git = "https://github.com/boundaryml/minijinja.git", branch = "value-cmp", features = [ "pycompat" ] }
 baml_workspace = { path = "crates/baml_workspace" }
+baml_optimize = { path = "crates/baml_optimize" }
 
 #  External dependencies
 anyhow = { version = "1" }
