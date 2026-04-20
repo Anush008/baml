@@ -22,6 +22,7 @@ sys_ops = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+similar = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = [ "sync", "rt", "macros" ] }
 vfs = { workspace = true }

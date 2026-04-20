@@ -1402,6 +1402,7 @@ dependencies = [
  "bex_vm_types",
  "serde",
  "serde_json",
+ "similar",
  "sys_native",
  "sys_ops",
  "tempfile",
