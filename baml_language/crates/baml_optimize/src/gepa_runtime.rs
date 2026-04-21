@@ -1,22 +1,23 @@
-//! GEPA runtime - wraps the embedded reflection BAML files as a live [`Bex`]
-//! runtime, ready to call reflection functions.
+//! GEPA runtime — wraps the embedded reflection BAML files as a live [`Bex`]
+//! runtime and exposes the reflection functions (`ProposeImprovements`,
+//! `MergeVariants`) to the orchestrator.
 //!
 //! `GEPARuntime::new()` materialises `gepa.baml` and `clients.baml` into a
-//! tempdir (used as the VFS anchor) and constructs an `Arc<dyn Bex>` runtime
-//! via [`bex_project::new`]. The tempdir is kept alive for the runtime's
-//! lifetime.
+//! tempdir and builds an `Arc<dyn Bex>` runtime via [`bex_project::new`].
+//! The tempdir is kept alive for the runtime's lifetime.
 //!
-//! Reflection entry points (`propose_improvements`, `merge_variants`, etc.)
-//! are stubbed for now — wiring them up requires a Rust ↔
-//! `BexExternalValue` conversion layer which is not yet available. See
-//! `baml_optimize/README` or the plan for the follow-on phase.
+//! Reflection functions are invoked with Rust values, converted to
+//! `BexExternalValue` via the [`value_bridge`](crate::value_bridge) helpers.
+//! Responses are parsed back into Rust types the same way.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use bex_project::{Bex, FsPath, SysOps};
+use bex_engine::FunctionCallContextBuilder;
+use bex_project::{Bex, BexArgs, FsPath, SysOps};
 use sys_native::SysOpsExt;
+use sys_types::CallId;
 use tempfile::TempDir;
 
 use crate::candidate::{
@@ -24,13 +25,13 @@ use crate::candidate::{
     ReflectiveExample,
 };
 use crate::gepa;
+use crate::value_bridge::{from_bex, to_bex};
 
 /// Runtime for GEPA reflection functions.
 ///
 /// Holds the compiled BAML runtime (as `Arc<dyn Bex>`) together with the
 /// tempdir whose path anchors the runtime's VFS root.
 pub struct GEPARuntime {
-    #[allow(dead_code)]
     bex: Arc<dyn Bex>,
     /// Kept alive so the tempdir isn't dropped under the runtime's feet.
     _temp_dir: TempDir,
@@ -38,11 +39,6 @@ pub struct GEPARuntime {
 
 impl GEPARuntime {
     /// Construct a new GEPA runtime from the embedded BAML sources.
-    ///
-    /// A tempdir is created to serve as the VFS root. `gepa.baml` and
-    /// `clients.baml` are also written to disk inside that tempdir so the
-    /// VFS has a real path to resolve; the source content is additionally
-    /// passed via the in-memory `files` map that `bex_project::new` expects.
     pub fn new() -> Result<Self> {
         let temp_dir = TempDir::new().context("failed to create GEPA temp dir")?;
         let root = temp_dir.path().to_path_buf();
@@ -79,36 +75,76 @@ impl GEPARuntime {
 
     /// Call `ProposeImprovements` to generate an improved function.
     ///
-    /// Not yet wired — requires a Rust-struct ↔ `BexExternalValue` bridge
-    /// that doesn't exist in the codebase yet. Tracked as a follow-on.
+    /// Inputs are serialised via `serde` → JSON → [`BexExternalValue`] and
+    /// passed as named args matching the BAML function's parameter list.
+    /// The return value is deserialised back to [`ImprovedFunction`].
     pub async fn propose_improvements(
         &self,
-        _current: &OptimizableFunction,
-        _failures: &[ReflectiveExample],
-        _successes: &[ReflectiveExample],
-        _objectives: &OptimizationObjectives,
-        _metrics: Option<&CurrentMetrics>,
+        current: &OptimizableFunction,
+        failures: &[ReflectiveExample],
+        successes: &[ReflectiveExample],
+        objectives: &OptimizationObjectives,
+        metrics: Option<&CurrentMetrics>,
     ) -> Result<ImprovedFunction> {
-        Err(anyhow!(
-            "GEPARuntime::propose_improvements not yet implemented: \
-             needs Rust ↔ BexExternalValue conversion layer"
-        ))
+        let mut args: HashMap<String, bex_external_types::BexExternalValue> = HashMap::new();
+        args.insert("current_function".into(), to_bex(current)?);
+        args.insert("failed_examples".into(), to_bex(&failures)?);
+        args.insert("successful_examples".into(), to_bex(&successes)?);
+        args.insert("optimization_objectives".into(), to_bex(objectives)?);
+        args.insert(
+            "current_metrics".into(),
+            match metrics {
+                Some(m) => to_bex(m)?,
+                None => bex_external_types::BexExternalValue::Null,
+            },
+        );
+
+        let result = self
+            .bex
+            .clone()
+            .call_function(
+                "ProposeImprovements",
+                BexArgs(args),
+                FunctionCallContextBuilder::new(CallId::next()).build(),
+            )
+            .await
+            .map_err(|e| anyhow!("ProposeImprovements call failed: {e:?}"))?;
+
+        from_bex::<ImprovedFunction>(&result)
+            .context("failed to deserialize ImprovedFunction from reflection result")
     }
 
     /// Call `MergeVariants` to combine two successful candidates.
     ///
-    /// Not yet wired — same blocker as [`GEPARuntime::propose_improvements`].
+    /// Currently unused by the orchestrator (merge iterations are deferred);
+    /// kept here as the natural home when that lands.
+    #[allow(dead_code)]
     pub async fn merge_variants(
         &self,
-        _variant_a: &OptimizableFunction,
-        _variant_b: &OptimizableFunction,
-        _variant_a_strengths: &[String],
-        _variant_b_strengths: &[String],
+        variant_a: &OptimizableFunction,
+        variant_b: &OptimizableFunction,
+        variant_a_strengths: &[String],
+        variant_b_strengths: &[String],
     ) -> Result<ImprovedFunction> {
-        Err(anyhow!(
-            "GEPARuntime::merge_variants not yet implemented: \
-             needs Rust ↔ BexExternalValue conversion layer"
-        ))
+        let mut args: HashMap<String, bex_external_types::BexExternalValue> = HashMap::new();
+        args.insert("variant_a".into(), to_bex(variant_a)?);
+        args.insert("variant_b".into(), to_bex(variant_b)?);
+        args.insert("variant_a_strengths".into(), to_bex(&variant_a_strengths)?);
+        args.insert("variant_b_strengths".into(), to_bex(&variant_b_strengths)?);
+
+        let result = self
+            .bex
+            .clone()
+            .call_function(
+                "MergeVariants",
+                BexArgs(args),
+                FunctionCallContextBuilder::new(CallId::next()).build(),
+            )
+            .await
+            .map_err(|e| anyhow!("MergeVariants call failed: {e:?}"))?;
+
+        from_bex::<ImprovedFunction>(&result)
+            .context("failed to deserialize ImprovedFunction from merge result")
     }
 }
 

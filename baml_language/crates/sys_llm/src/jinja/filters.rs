@@ -7,6 +7,19 @@ pub(crate) fn regex_match(value: &str, pattern: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Filter: `tojson` - Serialise any value to its JSON representation.
+///
+/// Matches the Jinja2/Ansible `tojson` convention. Used by the GEPA reflection
+/// prompts to embed structured data.
+pub(crate) fn tojson(value: Value) -> Result<String, minijinja::Error> {
+    serde_json::to_string(&value).map_err(|e| {
+        minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            format!("tojson: {e}"),
+        )
+    })
+}
+
 /// Filter: sum - Sum numeric values in a list.
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn sum(values: Vec<Value>) -> Value {

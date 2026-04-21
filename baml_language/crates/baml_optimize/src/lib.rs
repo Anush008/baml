@@ -6,6 +6,7 @@
 pub mod applier;
 pub mod candidate;
 pub mod discovery;
+pub mod engine_build;
 pub mod evaluator;
 mod gepa;
 pub mod gepa_runtime;
@@ -13,6 +14,7 @@ pub mod orchestrator;
 pub mod pareto;
 pub mod schema_extractor;
 pub mod storage;
+pub mod value_bridge;
 
 // Re-exports
 pub use applier::Applier;

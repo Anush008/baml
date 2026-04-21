@@ -91,6 +91,7 @@ fn create_environment() -> Environment<'static> {
     // Add filters
     env.add_filter("regex_match", filters::regex_match);
     env.add_filter("sum", filters::sum);
+    env.add_filter("tojson", filters::tojson);
 
     // Enable Python-compatible methods on primitives (e.g. str.format())
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);

@@ -29,6 +29,11 @@ pub struct TestResult {
     pub latency_ms: f64,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    /// Arguments the test was called with, keyed by parameter name. Used by
+    /// the reflection loop to build `ReflectiveExample`s for failures.
+    pub input_args: indexmap::IndexMap<String, BexExternalValue>,
+    /// Function return value on success, `None` on failure.
+    pub output: Option<BexExternalValue>,
 }
 
 /// Runs tests in parallel and aggregates scores.
@@ -87,7 +92,7 @@ async fn run_single_test(
 ) -> Result<TestResult> {
     // Build ordered args and snapshot asserts before any .await so the
     // engine borrow is released before we hit the await point.
-    let (ordered_args, asserts) = {
+    let (ordered_args, input_args, asserts) = {
         let test_case = engine
             .test_case(func_name, test_name)
             .ok_or_else(|| anyhow!("test case not found: {func_name}::{test_name}"))?;
@@ -101,10 +106,14 @@ async fn run_single_test(
                     .args
                     .get(name)
                     .map(test_arg_to_external)
+                    .map(|val| (name.to_string(), val))
                     .ok_or_else(|| anyhow!("missing argument '{name}' for {func_name}"))
             })
-            .collect::<Result<Vec<BexExternalValue>>>()?;
-        (ordered, test_case.asserts.clone())
+            .collect::<Result<Vec<(String, BexExternalValue)>>>()?;
+        let input_args: indexmap::IndexMap<String, BexExternalValue> =
+            ordered.iter().cloned().collect();
+        let positional: Vec<BexExternalValue> = ordered.into_iter().map(|(_, v)| v).collect();
+        (positional, input_args, test_case.asserts.clone())
     };
 
     let collector = Arc::new(Collector::new("optimize".into()));
@@ -118,16 +127,20 @@ async fn run_single_test(
     let latency_ms = start.elapsed().as_micros() as f64 / 1000.0;
 
     let usage = collector.usage();
-    let (passed, error) = match call_result {
+    let (passed, error, output) = match call_result {
         Ok(result) => {
             let failures = evaluate_test_asserts(&asserts, &result);
             if failures.is_empty() {
-                (true, None)
+                (true, None, Some(result))
             } else {
-                (false, Some(format!("assert failures: {}", failures.join("; "))))
+                (
+                    false,
+                    Some(format!("assert failures: {}", failures.join("; "))),
+                    Some(result),
+                )
             }
         }
-        Err(e) => (false, Some(format!("{e:?}"))),
+        Err(e) => (false, Some(format!("{e:?}")), None),
     };
 
     Ok(TestResult {
@@ -139,6 +152,8 @@ async fn run_single_test(
         latency_ms,
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
+        input_args,
+        output,
     })
 }
 
@@ -267,6 +282,8 @@ mod tests {
             latency_ms,
             input_tokens: input,
             output_tokens: output,
+            input_args: indexmap::IndexMap::new(),
+            output: None,
         }
     }
 
