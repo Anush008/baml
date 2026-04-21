@@ -267,18 +267,50 @@ fn display_object_from_pool(index: usize, objects: &ObjectPool) -> String {
 }
 
 fn display_object_ptr(ptr: HeapPtr) -> String {
+    display_object_ptr_depth(ptr, 1)
+}
+
+/// Like [`display_object_ptr`] but bounds recursion. At depth 0, nested
+/// `Instance`/`Variant` values are elided to the short `<ClassName
+/// instance>` form; at higher depths we show fields. Keeps error messages
+/// informative (the BAML built-in `baml.errors.DevOther { message: ... }`
+/// now reveals its `message` field) without blowing up on pathological
+/// cycles.
+fn display_object_ptr_depth(ptr: HeapPtr, depth: u32) -> String {
     // SAFETY: During debug display, we assume the pointer is valid
     let object = unsafe { ptr.get() };
     match object {
-        // This one's a bit tricky to print.
         Object::Instance(instance) => {
             // SAFETY: During debug display, we assume the pointer is valid
-            let class = unsafe { instance.class.get() };
-            match class {
-                Object::Class(class) => format!("<{} instance>", class.name),
-                // This will most likely never happen, but we're trying not
-                // to panic.
-                other => format!("<{other} instance>"),
+            let class_obj = unsafe { instance.class.get() };
+            let class_name = match class_obj {
+                Object::Class(c) => c.name.to_string(),
+                other => format!("<{other}>"),
+            };
+            if depth == 0 {
+                return format!("<{class_name} instance>");
+            }
+            let fields = if let Object::Class(class) = class_obj {
+                class
+                    .fields
+                    .iter()
+                    .zip(instance.fields.iter())
+                    .map(|(field, value)| {
+                        format!(
+                            "{}: {}",
+                            field.name,
+                            display_value_depth(value, depth - 1)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                String::new()
+            };
+            if fields.is_empty() {
+                format!("<{class_name} instance>")
+            } else {
+                format!("<{class_name} {{ {fields} }}>")
             }
         }
 
@@ -286,11 +318,34 @@ fn display_object_ptr(ptr: HeapPtr) -> String {
             // SAFETY: During debug display, we assume the pointer is valid
             let enm = unsafe { variant.enm.get() };
             match enm {
-                Object::Enum(enm) => format!("<{} variant>", enm.name),
+                Object::Enum(enm) => {
+                    let name = enm
+                        .variants
+                        .get(variant.index)
+                        .map(|v| v.name.as_str())
+                        .unwrap_or("?");
+                    format!("{}.{name}", enm.name)
+                }
                 other => format!("<{other} variant>"),
             }
         }
 
+        Object::String(s) => {
+            let escaped = s
+                .replace('\\', "\\\\")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            format!("\"{escaped}\"")
+        }
+
+        other => other.to_string(),
+    }
+}
+
+fn display_value_depth(value: &Value, depth: u32) -> String {
+    match value {
+        Value::Object(ptr) => display_object_ptr_depth(*ptr, depth),
         other => other.to_string(),
     }
 }
