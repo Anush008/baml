@@ -172,6 +172,14 @@ impl TestArgValue {
     }
 }
 
+/// A `@@assert(...)` attached to a test — carries the raw Jinja source that
+/// will be evaluated at test-run time against `this` (the function result).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertSpec {
+    pub expr: String,
+    pub label: Option<Name>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Test {
     pub name: Name,
@@ -179,6 +187,8 @@ pub struct Test {
     pub function_refs: Vec<Name>,
     /// Test arguments as key-value pairs.
     pub args: Vec<(Name, TestArgValue)>,
+    /// `@@assert(...)` block attributes in source order.
+    pub asserts: Vec<AssertSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -492,12 +502,21 @@ impl ItemTree {
             .iter()
             .map(|(k, v)| (k.clone(), convert_ast_test_arg_value(v)))
             .collect();
+        let asserts: Vec<AssertSpec> = t
+            .asserts
+            .iter()
+            .map(|a| AssertSpec {
+                expr: a.expr.clone(),
+                label: a.label.clone(),
+            })
+            .collect();
         self.tests.insert(
             id,
             Test {
                 name: t.name.clone(),
                 function_refs,
                 args,
+                asserts,
             },
         );
         id

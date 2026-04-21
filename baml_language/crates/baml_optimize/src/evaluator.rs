@@ -85,15 +85,16 @@ async fn run_single_test(
     test_name: &str,
     testset_name: Option<String>,
 ) -> Result<TestResult> {
-    // Build ordered args before any .await so the engine borrow is released.
-    let ordered_args = {
+    // Build ordered args and snapshot asserts before any .await so the
+    // engine borrow is released before we hit the await point.
+    let (ordered_args, asserts) = {
         let test_case = engine
             .test_case(func_name, test_name)
             .ok_or_else(|| anyhow!("test case not found: {func_name}::{test_name}"))?;
         let params = engine
             .function_params(func_name)
             .map_err(|e| anyhow!("failed to get params for {func_name}: {e:?}"))?;
-        params
+        let ordered = params
             .into_iter()
             .map(|(name, _ty)| {
                 test_case
@@ -102,7 +103,8 @@ async fn run_single_test(
                     .map(test_arg_to_external)
                     .ok_or_else(|| anyhow!("missing argument '{name}' for {func_name}"))
             })
-            .collect::<Result<Vec<BexExternalValue>>>()?
+            .collect::<Result<Vec<BexExternalValue>>>()?;
+        (ordered, test_case.asserts.clone())
     };
 
     let collector = Arc::new(Collector::new("optimize".into()));
@@ -117,7 +119,14 @@ async fn run_single_test(
 
     let usage = collector.usage();
     let (passed, error) = match call_result {
-        Ok(_) => (true, None),
+        Ok(result) => {
+            let failures = evaluate_test_asserts(&asserts, &result);
+            if failures.is_empty() {
+                (true, None)
+            } else {
+                (false, Some(format!("assert failures: {}", failures.join("; "))))
+            }
+        }
         Err(e) => (false, Some(format!("{e:?}"))),
     };
 
@@ -131,6 +140,34 @@ async fn run_single_test(
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
     })
+}
+
+/// Run every `@@assert` attached to a test against the function result.
+///
+/// Returns a list of human-readable failure descriptions — empty means all
+/// assertions passed.
+fn evaluate_test_asserts(
+    asserts: &[bex_vm_types::TestAssertion],
+    result: &BexExternalValue,
+) -> Vec<String> {
+    asserts
+        .iter()
+        .filter_map(|a| {
+            let label = a
+                .label
+                .as_ref()
+                .map_or_else(|| a.expr.clone(), |l| format!("{l}: {}", a.expr));
+            match sys_llm::evaluate_assertion(&a.expr, result) {
+                sys_llm::AssertOutcome::Passed => None,
+                sys_llm::AssertOutcome::Failed { rendered } => {
+                    Some(format!("{label} => {rendered}"))
+                }
+                sys_llm::AssertOutcome::Error { message } => {
+                    Some(format!("{label} (error: {message})"))
+                }
+            }
+        })
+        .collect()
 }
 
 impl CandidateScores {
@@ -231,6 +268,45 @@ mod tests {
             input_tokens: input,
             output_tokens: output,
         }
+    }
+
+    fn asserts(exprs: &[&str]) -> Vec<bex_vm_types::TestAssertion> {
+        exprs
+            .iter()
+            .map(|e| bex_vm_types::TestAssertion {
+                expr: (*e).to_string(),
+                label: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn asserts_pass_on_non_null_instance() {
+        let mut fields = indexmap::IndexMap::new();
+        fields.insert("name".to_string(), BexExternalValue::String("Meg".into()));
+        fields.insert("age".to_string(), BexExternalValue::Null);
+        let result = BexExternalValue::Instance {
+            class_name: "Person".into(),
+            fields,
+        };
+
+        let failures = evaluate_test_asserts(
+            &asserts(&["{{ this != null }}", "{{ this.name == \"Meg\" }}"]),
+            &result,
+        );
+        assert!(failures.is_empty(), "expected no failures, got {failures:?}");
+    }
+
+    #[test]
+    fn asserts_fail_against_null_result() {
+        let failures =
+            evaluate_test_asserts(&asserts(&["{{ this != null }}"]), &BexExternalValue::Null);
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].contains("this != null"),
+            "failure should mention the expr, got {:?}",
+            failures[0]
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ pub use types::{
     Class, ClassField, ClientBuildMeta, ClientBuildType, CollectorRef, ConstValue, Enum,
     EnumVariant, Function, FunctionKind, FunctionMeta, Future, Instance, MediaValue, Object,
     ObjectType, PanicClass, PendingFuture, Program, PromptAst, RetryPolicyMeta, SysOp,
-    SysOpErrorCategory, SysOpPanicCategory, TestArgValue, TestCase, Value, Variant,
+    SysOpErrorCategory, SysOpPanicCategory, TestArgValue, TestAssertion, TestCase, Value, Variant,
     sys_op_for_path, type_tags,
 };
 

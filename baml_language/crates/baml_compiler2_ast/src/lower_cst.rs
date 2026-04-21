@@ -18,7 +18,7 @@ use crate::{
         AstSourceMap, BuiltinKind, ConfigItemDef, EnumDef, Expr, ExprBody, ExprId, FieldDef,
         FunctionBodyDef, FunctionDef, GeneratorDef, Interpolation, Item, LetDef, LetOrigin,
         LlmBodyDef, Param, RawAttribute, RawAttributeArg, RawPrompt, SpannedTypeExpr,
-        TemplateStringDef, TestArgValue, TestDef, TypeAliasDef, VariantDef,
+        AssertDef, TemplateStringDef, TestArgValue, TestDef, TypeAliasDef, VariantDef,
     },
     companions::expand_companions,
     lower_expr_body, lower_type_expr,
@@ -910,14 +910,63 @@ fn lower_test(node: &SyntaxNode, diags: &mut Vec<LoweringDiagnostic>) -> Option<
         .and_then(|item| item.nested_block())
         .map(|block| lower_test_arg_block(&block))
         .unwrap_or_default();
+    let asserts = config_block
+        .as_ref()
+        .map(|cb| lower_test_asserts(cb))
+        .unwrap_or_default();
 
     Some(TestDef {
         name: Name::new(&test_name),
         config_items,
         args,
+        asserts,
         span: node.text_range(),
         name_span: name_token.text_range(),
     })
+}
+
+/// Collect `@@assert(...)` block attributes from a test's `CONFIG_BLOCK`.
+///
+/// Block attributes live as direct children of `CONFIG_BLOCK` in the CST.
+/// The arg list can be either `(expression)` or `(label, expression)`; the
+/// expression is always the last arg.
+fn lower_test_asserts(cb: &ast::ConfigBlock) -> Vec<AssertDef> {
+    cb.syntax()
+        .children()
+        .filter_map(ast::BlockAttribute::cast)
+        .filter_map(|attr| {
+            let name_token = attr.name()?;
+            if name_token.text() != "assert" {
+                return None;
+            }
+            let span = attr.syntax().text_range();
+
+            let raw_args: Vec<std::string::String> = attr
+                .syntax()
+                .children()
+                .filter(|n| n.kind() == baml_compiler_syntax::SyntaxKind::ATTRIBUTE_ARGS)
+                .flat_map(|args_node| {
+                    args_node
+                        .children()
+                        .map(|arg| arg.text().to_string().trim().to_string())
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            let (label, expr) = match raw_args.len() {
+                0 => return None,
+                1 => (None, raw_args.into_iter().next().unwrap()),
+                _ => {
+                    let mut it = raw_args.into_iter();
+                    let lbl = it.next().unwrap();
+                    let expr = it.last().unwrap();
+                    (Some(Name::new(&lbl)), expr)
+                }
+            };
+
+            Some(AssertDef { expr, label, span })
+        })
+        .collect()
 }
 
 /// Lower a nested `args { ... }` config block to ordered `(Name, TestArgValue)` pairs.
@@ -1000,8 +1049,38 @@ fn lower_test_arg_value(item: &ast::ConfigItem) -> TestArgValue {
         "true" => TestArgValue::Bool(true),
         "false" => TestArgValue::Bool(false),
         "null" => TestArgValue::Null,
-        _ => TestArgValue::String(text.trim_matches('"').to_string()),
+        _ => {
+            // `scalar_text` filters whitespace as trivia, which clobbers the
+            // interior of multi-word string literals like "Meg gave Pam".
+            // When the value is a string literal, prefer the raw CST text of
+            // that literal so spacing survives.
+            TestArgValue::String(string_literal_text(item).unwrap_or_else(|| {
+                text.trim_matches('"').to_string()
+            }))
+        }
     }
+}
+
+/// If `item`'s value is a string literal, return its contents with outer
+/// quotes stripped. Preserves interior whitespace by reading the raw CST text
+/// of the `STRING_LITERAL` / `RAW_STRING_LITERAL` node rather than token-
+/// concatenating (which drops whitespace trivia).
+fn string_literal_text(item: &ast::ConfigItem) -> Option<std::string::String> {
+    let cv = item.config_value_node()?;
+    let string_node = cv.descendants().find(|n| {
+        matches!(
+            n.kind(),
+            baml_compiler_syntax::SyntaxKind::STRING_LITERAL
+                | baml_compiler_syntax::SyntaxKind::RAW_STRING_LITERAL
+        )
+    })?;
+    let raw = string_node.text().to_string();
+    Some(
+        raw.trim()
+            .trim_start_matches(|c: char| c == '#' || c == '"')
+            .trim_end_matches(|c: char| c == '#' || c == '"')
+            .to_string(),
+    )
 }
 
 /// Extract the name expression element from a `TEST_EXPR_DEF` or `TESTSET_DEF` node.

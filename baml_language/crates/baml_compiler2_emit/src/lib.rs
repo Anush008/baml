@@ -809,10 +809,19 @@ pub fn generate_project_bytecode_with_opt(
                     .iter()
                     .map(|(k, v)| (k.to_string(), convert_test_arg_value(v)))
                     .collect();
+                let asserts: Vec<bex_vm_types::TestAssertion> = test_data
+                    .asserts
+                    .iter()
+                    .map(|a| bex_vm_types::TestAssertion {
+                        expr: a.expr.clone(),
+                        label: a.label.as_ref().map(ToString::to_string),
+                    })
+                    .collect();
                 program.test_cases.push(bex_vm_types::TestCase {
                     name: test_data.name.to_string(),
                     function_names,
                     args,
+                    asserts,
                 });
             }
         }

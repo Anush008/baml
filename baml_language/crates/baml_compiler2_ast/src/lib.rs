@@ -1379,4 +1379,51 @@ class C {
         assert_eq!(diags.len(), 1, "expected 1 diagnostic, got {diags:?}");
         assert_eq!(diags[0].0, "alias");
     }
+
+    #[test]
+    fn test_def_captures_asserts_and_args() {
+        let source = r##"
+class Person {
+  name string
+  age int?
+}
+
+function ExtractSubject(sentence: string) -> Person? {
+  client GPT5
+  prompt #"Extract {{ sentence }}"#
+}
+
+test Test1 {
+  functions [ExtractSubject]
+  args {
+    sentence "Meg gave Pam a dog"
+  }
+  @@assert({{ this != null }})
+  @@assert({{ this.name == "Meg" }})
+}
+"##;
+        let items = parse_and_lower(source);
+        let test = items
+            .into_iter()
+            .find_map(|item| match item {
+                Item::Test(t) => Some(t),
+                _ => None,
+            })
+            .expect("expected a TestDef");
+
+        assert_eq!(test.name.as_str(), "Test1");
+        // Args block is parsed into an ordered (name, value) list.
+        assert_eq!(test.args.len(), 1);
+        assert_eq!(test.args[0].0.as_str(), "sentence");
+        match &test.args[0].1 {
+            crate::ast::TestArgValue::String(s) => assert_eq!(s, "Meg gave Pam a dog"),
+            other => panic!("expected String, got {other:?}"),
+        }
+
+        // Both `@@assert(...)` attributes land in the asserts vec in order.
+        assert_eq!(test.asserts.len(), 2);
+        assert_eq!(test.asserts[0].expr, "{{ this != null }}");
+        assert!(test.asserts[0].label.is_none());
+        assert_eq!(test.asserts[1].expr, "{{ this.name == \"Meg\" }}");
+    }
 }

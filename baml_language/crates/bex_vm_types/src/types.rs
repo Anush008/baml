@@ -573,6 +573,16 @@ pub enum TestArgValue {
     },
 }
 
+/// A `@@assert(...)` attached to a compiled test.
+///
+/// `expr` is the raw Jinja template the user wrote (e.g. `{{ this != null }}`);
+/// evaluation happens at test-run time against the function result.
+#[derive(Clone, Debug)]
+pub struct TestAssertion {
+    pub expr: String,
+    pub label: Option<String>,
+}
+
 /// A compiled test case, ready for execution.
 #[derive(Clone, Debug)]
 pub struct TestCase {
@@ -582,6 +592,8 @@ pub struct TestCase {
     pub function_names: Vec<String>,
     /// Test arguments, keyed by parameter name.
     pub args: IndexMap<String, TestArgValue>,
+    /// `@@assert(...)` attachments in source order.
+    pub asserts: Vec<TestAssertion>,
 }
 
 /// Compile-time constant values.

@@ -26,8 +26,9 @@ use std::{str::FromStr, sync::Arc};
 use bex_external_types::BexExternalValue;
 // Used by bex_engine tests
 pub use jinja::{
-    OutputFormatContent, RenderContext, RenderContextClient, RenderEnum, RenderEnumVariant,
-    RenderPromptError, preprocess_template, render_prompt,
+    AssertOutcome, OutputFormatContent, RenderContext, RenderContextClient, RenderEnum,
+    RenderEnumVariant, RenderPromptError, evaluate_assertion, external_value_to_jinja,
+    preprocess_template, render_prompt,
 };
 // --- Crate-internal re-exports (used by submodules via `crate::`) ---
 pub(crate) use model_features::{AllowedMetadata, ModelFeatures};

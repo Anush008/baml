@@ -119,8 +119,13 @@ impl OptimizeArgs {
         let bytecode = baml_compiler2_emit::generate_project_bytecode(&db, &compile_options)
             .map_err(|e| anyhow!("compilation failed: {e:?}"))?;
 
-        let engine = BexEngine::new(bytecode, Arc::new(sys_native::SysOps::native()), None)
-            .map_err(|e| anyhow!("failed to create engine: {e:?}"))?;
+        let engine = BexEngine::new(
+            bytecode,
+            Arc::new(sys_native::SysOps::native()),
+            None,
+            Vec::new(),
+        )
+        .map_err(|e| anyhow!("failed to create engine: {e:?}"))?;
         let engine = Arc::new(engine);
 
         let parsed = parse_objectives(&self.weights);

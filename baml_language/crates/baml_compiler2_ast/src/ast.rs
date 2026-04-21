@@ -880,6 +880,19 @@ pub enum TestArgValue {
     Map(Vec<(std::string::String, TestArgValue)>),
 }
 
+/// A `@@assert(...)` block attribute on a test.
+///
+/// Holds the raw Jinja template text the user wrote (e.g. `{{ this != null }}`);
+/// evaluation happens at test-run time, with `this` bound to the function result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertDef {
+    /// Raw Jinja source as typed, including the `{{ }}` delimiters.
+    pub expr: std::string::String,
+    /// Optional label (`@@assert(name, {{ ... }})`). None for unlabeled asserts.
+    pub label: Option<Name>,
+    pub span: TextRange,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestDef {
     pub name: Name,
@@ -887,6 +900,8 @@ pub struct TestDef {
     /// Args parsed from the nested `args { ... }` block, in source order.
     /// Empty if the test has no `args` block.
     pub args: Vec<(Name, TestArgValue)>,
+    /// `@@assert(...)` block attributes, in source order.
+    pub asserts: Vec<AssertDef>,
     pub span: TextRange,
     pub name_span: TextRange,
 }

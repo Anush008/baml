@@ -17,7 +17,7 @@ fn is_media_wrapper_class(class_name: &str) -> bool {
 ///
 /// `BexExternalValue` is already fully extracted from the VM heap,
 /// so no heap access is needed here.
-pub(crate) fn external_value_to_jinja(
+pub fn external_value_to_jinja(
     value: &BexExternalValue,
     media_handles: &mut std::collections::HashMap<usize, MediaValue>,
 ) -> Result<JinjaValue, RenderPromptError> {

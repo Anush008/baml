@@ -220,7 +220,7 @@ impl TestArgs {
 }
 
 // ---------------------------------------------------------------------------
-// Legacy test execution (unchanged from the original implementation)
+// Legacy test execution
 // ---------------------------------------------------------------------------
 
 fn run_legacy_test(ctx: &RunCtx, t: &DiscoveredTest, passed: &mut usize, failed: &mut usize) {
@@ -256,9 +256,19 @@ fn run_legacy_test(ctx: &RunCtx, t: &DiscoveredTest, passed: &mut usize, failed:
         ),
     ) {
         Ok(result) => {
-            println!("PASS {}::{}", t.function_name, t.test_name);
-            println!("  => {result:?}");
-            *passed += 1;
+            let failures = evaluate_asserts(&test_case.asserts, &result);
+            if failures.is_empty() {
+                println!("PASS {}::{}", t.function_name, t.test_name);
+                println!("  => {result:?}");
+                *passed += 1;
+            } else {
+                eprintln!("FAIL {}::{}", t.function_name, t.test_name);
+                eprintln!("  => {result:?}");
+                for msg in &failures {
+                    eprintln!("  assert failed: {msg}");
+                }
+                *failed += 1;
+            }
         }
         Err(e) => {
             eprintln!("FAIL {}::{}", t.function_name, t.test_name);
@@ -268,6 +278,35 @@ fn run_legacy_test(ctx: &RunCtx, t: &DiscoveredTest, passed: &mut usize, failed:
     }
 }
 
+/// Evaluate every `@@assert` attached to a test against the function result.
+///
+/// Returns a list of human-readable failure messages — one per assertion that
+/// did not pass. Empty vec means the test passed.
+fn evaluate_asserts(
+    asserts: &[bex_vm_types::TestAssertion],
+    result: &BexExternalValue,
+) -> Vec<String> {
+    asserts
+        .iter()
+        .filter_map(|a| {
+            let label = a
+                .label
+                .as_ref()
+                .map_or_else(|| a.expr.clone(), |l| format!("{l}: {}", a.expr));
+            match sys_llm::evaluate_assertion(&a.expr, result) {
+                sys_llm::AssertOutcome::Passed => None,
+                sys_llm::AssertOutcome::Failed { rendered } => {
+                    Some(format!("{label} => {rendered}"))
+                }
+                sys_llm::AssertOutcome::Error { message } => {
+                    Some(format!("{label} (error: {message})"))
+                }
+            }
+        })
+        .collect()
+}
+
+/// Build ordered args Vec from a test case, matching the function's parameter order.
 fn build_ordered_args(
     engine: &BexEngine,
     function_name: &str,
