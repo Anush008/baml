@@ -202,6 +202,7 @@ impl OptimizeArgs {
             max_iterations: self.max_iterations,
             parallel: self.parallel,
             objectives,
+            merge_every: 3,
             verbose: self.verbose,
         };
 

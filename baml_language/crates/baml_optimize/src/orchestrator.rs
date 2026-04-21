@@ -44,7 +44,23 @@ pub struct OrchestratorConfig {
     pub max_iterations: u32,
     pub parallel: usize,
     pub objectives: Vec<Objective>,
+    /// Attempt a merge iteration every N iterations when the Pareto frontier
+    /// has ≥ 2 members. `0` disables merging entirely. Default: `3`.
+    pub merge_every: u32,
     pub verbose: bool,
+}
+
+impl Default for OrchestratorConfig {
+    fn default() -> Self {
+        Self {
+            function_name: String::new(),
+            max_iterations: 50,
+            parallel: 8,
+            objectives: Vec::new(),
+            merge_every: 3,
+            verbose: false,
+        }
+    }
 }
 
 /// Summary produced when a run finishes.
@@ -142,7 +158,13 @@ impl GEPAOrchestrator {
 
         while self.current_iteration < self.config.max_iterations as usize {
             self.current_iteration += 1;
-            if let Err(e) = self.run_reflection_iteration().await {
+            let do_merge = self.should_merge_this_iteration();
+            let result = if do_merge {
+                self.run_merge_iteration().await
+            } else {
+                self.run_reflection_iteration().await
+            };
+            if let Err(e) = result {
                 // Surface the error but don't abort the whole run — a flaky
                 // LLM call shouldn't throw away the baseline and any
                 // previously-accepted candidates.
@@ -155,6 +177,16 @@ impl GEPAOrchestrator {
         }
 
         self.finalize()
+    }
+
+    /// Decide whether this iteration should attempt a merge. True when
+    /// `merge_every` is non-zero, the iteration index is a multiple of it,
+    /// and the Pareto frontier has ≥ 2 members to merge.
+    fn should_merge_this_iteration(&self) -> bool {
+        let every = self.config.merge_every as usize;
+        every > 0
+            && self.current_iteration % every == 0
+            && self.pareto.frontier().len() >= 2
     }
 
     /// Seed the run with the baseline candidate and evaluate it.
@@ -261,7 +293,6 @@ impl GEPAOrchestrator {
             println!("Reflection rationale: {}", improved.rationale);
         }
 
-        let new_id = self.candidates.len();
         let new_function = OptimizableFunction {
             function_name: parent_function.function_name.clone(),
             prompt_text: improved.prompt_text.clone(),
@@ -270,7 +301,7 @@ impl GEPAOrchestrator {
             function_source: parent_function.function_source.clone(),
         };
         let new_candidate = Candidate {
-            id: new_id,
+            id: self.candidates.len(),
             iteration: self.current_iteration,
             parent_ids: vec![parent_id],
             method: CandidateMethod::Reflection,
@@ -278,9 +309,69 @@ impl GEPAOrchestrator {
             scores: None,
             rationale: Some(improved.rationale.clone()),
         };
-        self.candidates.push(new_candidate);
+        self.apply_and_evaluate(new_candidate).await
+    }
 
-        // Rewrite sources and rebuild the engine.
+    /// One merge step: select two Pareto parents → ask the reflection model
+    /// to combine their strengths → apply and evaluate like any other
+    /// candidate.
+    async fn run_merge_iteration(&mut self) -> Result<()> {
+        let (id_a, id_b) = self
+            .pareto
+            .select_for_merge(&self.candidates)
+            .context("cannot merge: fewer than two frontier members")?;
+
+        if self.config.verbose {
+            println!(
+                "\n--- Iteration {}/{} (merge) ---",
+                self.current_iteration, self.config.max_iterations
+            );
+            println!("Merging candidates #{id_a} and #{id_b}");
+        }
+
+        let variant_a = self.candidates[id_a].function.clone();
+        let variant_b = self.candidates[id_b].function.clone();
+        let strengths_a = candidate_strengths(&self.candidates[id_a], &self.config.objectives);
+        let strengths_b = candidate_strengths(&self.candidates[id_b], &self.config.objectives);
+
+        let improved: ImprovedFunction = self
+            .gepa_runtime
+            .merge_variants(&variant_a, &variant_b, &strengths_a, &strengths_b)
+            .await
+            .context("merge_variants failed")?;
+
+        if self.config.verbose {
+            println!("Merge rationale: {}", improved.rationale);
+        }
+
+        // Preserve the function name / source-of-truth from variant A; the
+        // merged function targets the same source location.
+        let new_function = OptimizableFunction {
+            function_name: variant_a.function_name.clone(),
+            prompt_text: improved.prompt_text.clone(),
+            classes: improved.classes.clone(),
+            enums: improved.enums.clone(),
+            function_source: variant_a.function_source.clone(),
+        };
+        let new_candidate = Candidate {
+            id: self.candidates.len(),
+            iteration: self.current_iteration,
+            parent_ids: vec![id_a, id_b],
+            method: CandidateMethod::Merge,
+            function: new_function,
+            scores: None,
+            rationale: Some(improved.rationale.clone()),
+        };
+        self.apply_and_evaluate(new_candidate).await
+    }
+
+    /// Shared tail for reflection + merge iterations: rewrite sources,
+    /// rebuild the engine, evaluate the candidate, update the Pareto
+    /// frontier, persist artifacts.
+    async fn apply_and_evaluate(&mut self, candidate: Candidate) -> Result<()> {
+        let new_id = candidate.id;
+        self.candidates.push(candidate);
+
         let modified_sources = self
             .applier
             .generate_modified_files(&self.candidates[new_id], &self.base_sources)
@@ -306,7 +397,7 @@ impl GEPAOrchestrator {
             .evaluator
             .evaluate(new_engine.clone(), &self.tests)
             .await
-            .context("failed to evaluate reflection candidate")?;
+            .context("failed to evaluate new candidate")?;
 
         self.total_evals += self.tests.len();
         self.candidates[new_id].scores = Some(scores.clone());
@@ -325,10 +416,6 @@ impl GEPAOrchestrator {
             println!("Pareto frontier: {:?}", self.pareto.frontier());
         }
 
-        // If the new candidate is strictly better and the parent is
-        // evicted, future iterations will naturally select from the new
-        // frontier. We also swap `self.engine` to the winner so a human
-        // reading through isn't surprised — but it's not load-bearing.
         if self.pareto.frontier().contains(&new_id) {
             self.engine = new_engine;
         }
@@ -459,6 +546,37 @@ fn build_objectives(objectives: &[Objective], parent: &Candidate) -> Optimizatio
     }
 }
 
+/// Build a short list of human-readable "strengths" for a candidate,
+/// suitable as input to `merge_variants`.
+///
+/// Today: one string per configured objective, naming it and the candidate's
+/// current value for it. This is what the engine's equivalent does too —
+/// the reflection model treats these as hints, not facts.
+fn candidate_strengths(candidate: &Candidate, objectives: &[Objective]) -> Vec<String> {
+    let Some(scores) = candidate.scores.as_ref() else {
+        return Vec::new();
+    };
+    objectives
+        .iter()
+        .map(|o| match o.name.as_str() {
+            "accuracy" => format!("accuracy={:.1}%", scores.test_pass_rate * 100.0),
+            "tokens" => format!(
+                "tokens={:.0}",
+                scores.avg_prompt_tokens + scores.avg_completion_tokens
+            ),
+            "latency" => format!("latency={:.0}ms", scores.avg_latency_ms),
+            other => {
+                if let Some((_, testset)) = other.split_once(':') {
+                    let v = scores.per_testset_scores.get(testset).copied().unwrap_or(0.0);
+                    format!("{other}={:.2}", v)
+                } else {
+                    format!("{other}=0")
+                }
+            }
+        })
+        .collect()
+}
+
 fn build_metrics(scores: &CandidateScores) -> CurrentMetrics {
     CurrentMetrics {
         test_pass_rate: scores.test_pass_rate,
@@ -574,6 +692,47 @@ mod tests {
         assert_eq!(out.objectives[1].name, "latency");
         assert!((out.objectives[1].current_value - 180.0).abs() < 1e-9);
         assert_eq!(out.objectives[1].direction, "minimize");
+    }
+
+    #[test]
+    fn candidate_strengths_names_configured_objectives() {
+        let objectives = vec![
+            Objective::new("accuracy", Direction::Maximize, 1.0),
+            Objective::new("latency", Direction::Minimize, 0.5),
+            Objective::new("tokens", Direction::Minimize, 0.2),
+        ];
+        let candidate = Candidate {
+            id: 1,
+            iteration: 0,
+            parent_ids: vec![],
+            method: CandidateMethod::Initial,
+            function: OptimizableFunction {
+                function_name: "F".into(),
+                prompt_text: String::new(),
+                classes: vec![],
+                enums: vec![],
+                function_source: None,
+            },
+            scores: Some(CandidateScores {
+                test_pass_rate: 0.8,
+                tests_passed: 4,
+                tests_total: 5,
+                avg_prompt_tokens: 40.0,
+                avg_completion_tokens: 10.0,
+                avg_latency_ms: 250.0,
+                per_testset_scores: HashMap::new(),
+            }),
+            rationale: None,
+        };
+        let strengths = candidate_strengths(&candidate, &objectives);
+        assert_eq!(
+            strengths,
+            vec![
+                "accuracy=80.0%".to_string(),
+                "latency=250ms".to_string(),
+                "tokens=50".to_string(),
+            ]
+        );
     }
 
     #[test]
