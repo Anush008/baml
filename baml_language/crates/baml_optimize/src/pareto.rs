@@ -128,13 +128,20 @@ impl ParetoFrontier {
     }
 
     /// Pick the most diverse pair on the frontier — used as parents for a
-    /// merge reflection. Returns `None` if fewer than two members.
+    /// merge reflection. Returns `None` only when the frontier has fewer
+    /// than two members; if every pair has identical scores (diversity 0),
+    /// we still return the first pair so the caller can attempt a merge.
     pub fn select_for_merge(&self, candidates: &[Candidate]) -> Option<(usize, usize)> {
         if self.frontier.len() < 2 {
             return None;
         }
-        let mut best = None;
-        let mut best_diversity = 0.0;
+        // Seed with the first pair so a frontier of identical-score
+        // candidates still yields Some(..).
+        let mut best = (self.frontier[0], self.frontier[1]);
+        let mut best_diversity = self.diversity(
+            candidates[best.0].scores.as_ref(),
+            candidates[best.1].scores.as_ref(),
+        );
         for (i, &a) in self.frontier.iter().enumerate() {
             for &b in &self.frontier[i + 1..] {
                 let d = self.diversity(
@@ -143,11 +150,11 @@ impl ParetoFrontier {
                 );
                 if d > best_diversity {
                     best_diversity = d;
-                    best = Some((a, b));
+                    best = (a, b);
                 }
             }
         }
-        best
+        Some(best)
     }
 
     fn weighted_score(&self, scores: Option<&CandidateScores>) -> f64 {

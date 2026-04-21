@@ -1,13 +1,14 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use baml_db::{baml_compiler2_emit, baml_compiler_diagnostics::Severity};
 use baml_optimize::orchestrator::initial_function_from_db;
 use baml_optimize::{
-    GEPAOrchestrator, Objective, OrchestratorConfig, discover_all_tests, parse_objectives,
+    Applier, Candidate, GEPAOrchestrator, Objective, OrchestratorConfig, discover_all_tests,
+    parse_objectives,
 };
 use baml_project::ProjectDatabase;
 use baml_workspace::discover_baml_files;
@@ -54,6 +55,23 @@ pub struct OptimizeArgs {
     #[arg(long)]
     pub resume: Option<PathBuf>,
 
+    /// Open the live TUI viewer on an existing run directory and exit
+    /// without running optimization. Useful for post-mortem inspection.
+    #[arg(long, value_name = "RUN_DIR")]
+    pub view: Option<PathBuf>,
+
+    /// Disable the live TUI viewer that otherwise attaches during a run.
+    /// Plain-text progress (and orchestrator error output) is printed to
+    /// the terminal instead. Pareto selection at the end still prompts
+    /// interactively unless `--yes` is passed.
+    #[arg(long)]
+    pub no_ui: bool,
+
+    /// Auto-apply the best Pareto candidate at the end of a run without
+    /// prompting. Implied in non-interactive contexts.
+    #[arg(long)]
+    pub yes: bool,
+
     /// Verbose progress output
     #[arg(long)]
     pub verbose: bool,
@@ -66,6 +84,14 @@ impl OptimizeArgs {
     }
 
     async fn run_async(&self) -> Result<crate::ExitCode> {
+        // Viewer mode: open the TUI against an existing run and exit.
+        if let Some(view_dir) = &self.view {
+            let canon = std::fs::canonicalize(view_dir)
+                .with_context(|| format!("cannot resolve view dir: {}", view_dir.display()))?;
+            baml_optimize::run_tui(&canon).context("TUI viewer failed")?;
+            return Ok(crate::ExitCode::Success);
+        }
+
         // Resume short-circuits — we just print the saved summary and exit.
         if let Some(resume_dir) = &self.resume {
             return resume_from_run_dir(resume_dir);
@@ -120,7 +146,57 @@ impl OptimizeArgs {
             return Ok(crate::ExitCode::Other);
         }
 
+        let initial_function = initial_function_from_db(&db, &self.function)
+            .with_context(|| format!("failed to locate function '{}'", self.function))?;
+
+        let compile_options = baml_compiler2_emit::CompileOptions {
+            emit_test_cases: true,
+        };
+        let bytecode = baml_compiler2_emit::generate_project_bytecode(&db, &compile_options)
+            .map_err(|e| anyhow!("compilation failed: {e:?}"))?;
+
+        let engine = BexEngine::new(
+            bytecode,
+            Arc::new(sys_native::SysOps::native()),
+            None,
+            Vec::new(),
+        )
+        .map_err(|e| anyhow!("failed to create engine: {e:?}"))?;
+        let engine = Arc::new(engine);
+
+        // Discovery in two halves: legacy `test { ... }` blocks come
+        // from the HIR item tree (no engine needed); new-style
+        // `testset { }` tests live in a runtime-built registry and
+        // require the engine to materialise.
+        //
+        // Testset tests don't carry a target function name in their
+        // registered path (their body can call any function), so we
+        // stamp `--function` onto each of them here. This keeps
+        // per-testset scoring + display consistent with legacy tests,
+        // and lets the existing include/exclude filter match on name.
         let mut tests = discover_all_tests(&db, &[self.function.clone()]);
+        let (_registry, mut testset_tests) = baml_optimize::discover_testset_tests(&engine)
+            .await
+            .context("failed to discover testset tests")?;
+        for t in &mut testset_tests {
+            t.function_name = self.function.clone();
+        }
+        tests.extend(testset_tests);
+
+        // Keep only testset tests whose body actually calls the target
+        // function (via LSP find-references). Legacy tests already
+        // declare their target explicitly via `functions [...]`, so they
+        // pass through untouched. Tests with dynamically-named testsets
+        // are also kept — we can't prove they don't call the function.
+        let (retained, dropped) =
+            baml_optimize::retain_tests_calling_function(&db, tests, &self.function);
+        tests = retained;
+        if dropped > 0 && self.verbose {
+            println!(
+                "Dropped {dropped} testset test(s) that don't reference {}",
+                self.function
+            );
+        }
         let discovered = tests.len();
 
         // Apply include/exclude filters (shared with `baml-cli test`).
@@ -158,24 +234,6 @@ impl OptimizeArgs {
             );
         }
 
-        let initial_function = initial_function_from_db(&db, &self.function)
-            .with_context(|| format!("failed to locate function '{}'", self.function))?;
-
-        let compile_options = baml_compiler2_emit::CompileOptions {
-            emit_test_cases: true,
-        };
-        let bytecode = baml_compiler2_emit::generate_project_bytecode(&db, &compile_options)
-            .map_err(|e| anyhow!("compilation failed: {e:?}"))?;
-
-        let engine = BexEngine::new(
-            bytecode,
-            Arc::new(sys_native::SysOps::native()),
-            None,
-            Vec::new(),
-        )
-        .map_err(|e| anyhow!("failed to create engine: {e:?}"))?;
-        let engine = Arc::new(engine);
-
         let parsed = parse_objectives(&self.weights);
         let objectives = if parsed.is_empty() {
             vec![Objective::new(
@@ -207,10 +265,52 @@ impl OptimizeArgs {
         };
 
         let mut orchestrator =
-            GEPAOrchestrator::new(config, engine, from, tests, initial_function)?;
-        let result = orchestrator.run().await?;
+            GEPAOrchestrator::new(config, engine, from.clone(), tests, initial_function)?;
+
+        // Launch the live TUI in a background thread (default behavior
+        // unless --no-ui). The orchestrator and TUI communicate through
+        // files inside the run directory (`stop_requested`,
+        // `apply_request.json`), so no shared state crosses the thread
+        // boundary.
+        let tui_handle = if self.no_ui {
+            None
+        } else {
+            let run_dir = orchestrator_run_dir(&orchestrator).to_path_buf();
+            println!("Launching live TUI viewer (press 'q' to close, Enter to apply and stop)...");
+            // Give the storage dir a beat to settle before the TUI opens it.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Some(std::thread::spawn(move || {
+                if let Err(e) = baml_optimize::run_tui_live(&run_dir) {
+                    eprintln!("TUI error: {e}");
+                }
+            }))
+        };
+
+        let run_result = orchestrator.run().await;
+
+        // Whatever happened, tear the TUI thread down before printing
+        // anything else so it doesn't clobber our output.
+        if let Some(handle) = tui_handle {
+            let _ = handle.join();
+        }
+
+        let result = match run_result {
+            Ok(r) => r,
+            Err(e) => {
+                // Record the error so a lingering TUI attached to the same
+                // dir can surface it. Failure here is best-effort.
+                let _ = std::fs::write(
+                    std::path::Path::new(".baml_optimize").join("last_error.txt"),
+                    format!("{e:?}"),
+                );
+                return Err(e);
+            }
+        };
 
         println!("\n=== Optimization Complete ===");
+        if result.stopped_early {
+            println!("(stopped early via TUI signal)");
+        }
         println!("Function: {}", result.function_name);
         println!("Best candidate: #{}", result.best_candidate_id);
         println!(
@@ -223,9 +323,82 @@ impl OptimizeArgs {
         println!("Total iterations: {}", result.total_iterations);
         println!("Total evaluations: {}", result.total_evaluations);
         println!("Pareto frontier size: {}", result.pareto_frontier_size);
+        println!("Run dir: {}", result.run_dir.display());
+
+        // Decide which candidate to apply back into the user's baml_src.
+        // 1. If the TUI wrote an apply request, honor it.
+        // 2. Else if --yes or only one Pareto candidate, pick the best.
+        // 3. Else prompt the user with the Pareto frontier.
+        let apply_id = if let Some(id) = baml_optimize::read_apply_request(&result.run_dir) {
+            Some(id)
+        } else if result.pareto_frontier.is_empty() {
+            None
+        } else if self.yes {
+            Some(result.best_candidate_id)
+        } else {
+            // Load objectives for display
+            let objectives = baml_optimize::Storage::load(result.run_dir.clone())
+                .ok()
+                .and_then(|s| s.load_config().ok())
+                .map(|c| c.objectives)
+                .unwrap_or_default();
+            baml_optimize::display_pareto_and_select(
+                &result.candidates,
+                &result.pareto_frontier,
+                &objectives,
+                &result.function_name,
+            )
+        };
+
+        if let Some(id) = apply_id {
+            match apply_candidate_to_disk(&from, &result.candidates, id) {
+                Ok(()) => println!("Applied candidate #{id} to {}", from.display()),
+                Err(e) => eprintln!("Failed to apply candidate #{id}: {e:?}"),
+            }
+        } else {
+            println!("No candidate applied. Inspect the run with:");
+            println!("  baml-cli optimize --view {}", result.run_dir.display());
+        }
 
         Ok(crate::ExitCode::Success)
     }
+}
+
+/// Borrow the orchestrator's run directory. The orchestrator owns its
+/// `Storage`; this helper keeps the CLI from having to care where the
+/// dir lives beyond the returned path.
+fn orchestrator_run_dir(orch: &GEPAOrchestrator) -> &Path {
+    orch.run_dir()
+}
+
+/// Overwrite `baml_src` under `root` with the sources that produced
+/// candidate `id`. Reads the current tree, applies the candidate's
+/// prompt/schema changes through [`Applier`], and writes each file back.
+fn apply_candidate_to_disk(root: &Path, candidates: &[Candidate], id: usize) -> Result<()> {
+    let candidate = candidates
+        .iter()
+        .find(|c| c.id == id)
+        .with_context(|| format!("candidate #{id} not found"))?;
+
+    let sources = baml_optimize::engine_build::read_sources(root)
+        .with_context(|| format!("failed to read sources under {}", root.display()))?;
+    let applier = Applier::new(root.to_path_buf());
+    let modified = applier
+        .generate_modified_files(candidate, &sources)
+        .context("failed to generate modified files for candidate")?;
+
+    for (rel, content) in &modified {
+        if sources.get(rel).map(|s| s == content).unwrap_or(false) {
+            continue;
+        }
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, content)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Inspect a prior run directory and print a summary of where it ended up.

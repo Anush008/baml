@@ -71,6 +71,15 @@ pub struct OptimizationResult {
     pub total_iterations: usize,
     pub total_evaluations: usize,
     pub pareto_frontier_size: usize,
+    /// Where this run persisted its artifacts (for TUI / `--resume`).
+    pub run_dir: PathBuf,
+    /// Pareto frontier candidate ids at the moment the run exited.
+    pub pareto_frontier: Vec<usize>,
+    /// Every candidate the run produced, in id order.
+    pub candidates: Vec<Candidate>,
+    /// `true` when the run halted early because a stop signal was observed
+    /// (e.g. the TUI wrote `stop_requested` / `apply_request.json`).
+    pub stopped_early: bool,
 }
 
 /// Main GEPA orchestrator.
@@ -152,11 +161,28 @@ impl GEPAOrchestrator {
         })
     }
 
+    /// Path to this run's storage directory. Exposed so a live TUI can be
+    /// launched against it while the run is in flight.
+    pub fn run_dir(&self) -> &std::path::Path {
+        self.storage.run_dir()
+    }
+
     /// Drive the optimization run to completion.
     pub async fn run(&mut self) -> Result<OptimizationResult> {
         self.initialize().await?;
 
+        let mut stopped_early = false;
         while self.current_iteration < self.config.max_iterations as usize {
+            // File-based stop signal from a live TUI. Checked at iteration
+            // boundaries so we never kill an in-flight evaluation.
+            if crate::storage::is_stop_requested(self.storage.run_dir()) {
+                if self.config.verbose {
+                    println!("\nStop signal received — halting optimization.");
+                }
+                stopped_early = true;
+                break;
+            }
+
             self.current_iteration += 1;
             let do_merge = self.should_merge_this_iteration();
             let result = if do_merge {
@@ -176,7 +202,7 @@ impl GEPAOrchestrator {
             self.save_checkpoint()?;
         }
 
-        self.finalize()
+        self.finalize(stopped_early)
     }
 
     /// Decide whether this iteration should attempt a merge. True when
@@ -434,7 +460,7 @@ impl GEPAOrchestrator {
         self.storage.save_checkpoint(&state)
     }
 
-    fn finalize(&self) -> Result<OptimizationResult> {
+    fn finalize(&self, stopped_early: bool) -> Result<OptimizationResult> {
         let best_id = self
             .pareto
             .select_for_reflection(&self.candidates)
@@ -454,6 +480,10 @@ impl GEPAOrchestrator {
             total_iterations: self.current_iteration,
             total_evaluations: self.total_evals,
             pareto_frontier_size: self.pareto.frontier().len(),
+            run_dir: self.storage.run_dir().to_path_buf(),
+            pareto_frontier: self.pareto.frontier().to_vec(),
+            candidates: self.candidates.clone(),
+            stopped_early,
         })
     }
 }
@@ -490,7 +520,7 @@ fn build_examples(results: &[TestResult], successes_only: bool) -> Vec<Reflectiv
                 generated_outputs,
                 feedback,
                 failure_location: if r.passed { None } else { Some("assertion".into()) },
-                test_source: None,
+                test_source: r.test_source.clone(),
                 test_name: Some(r.test_name.clone()),
                 prompt_tokens: r.input_tokens.map(|t| t as f64),
                 completion_tokens: r.output_tokens.map(|t| t as f64),
@@ -626,6 +656,7 @@ mod tests {
             } else {
                 None
             },
+            test_source: None,
         }
     }
 

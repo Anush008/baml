@@ -293,8 +293,10 @@ class Client {
           };
           result
         } else {
+          // Surface the response body so auth / quota / model-name errors
+          // are actionable instead of opaque.
           let error_body = http_response.text() catch (e) {
-            _ => { "" }
+            _ => { "<could not read response body>" }
           };
           if (active_delay_ms > 0) {
             root.sys.sleep(active_delay_ms)

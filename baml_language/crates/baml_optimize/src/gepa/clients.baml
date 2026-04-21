@@ -16,6 +16,10 @@ client<llm> ReflectionModel {
     options {
         temperature 0.7
         model "claude-opus-4-5-20251101"
+        // Anthropic's Messages API requires max_tokens; the direct path
+        // does not default it, so we set a generous ceiling for reflection
+        // output (prompt + classes + enums + rationale).
+        max_tokens 8192
         api_key env.ANTHROPIC_API_KEY
     }
 }

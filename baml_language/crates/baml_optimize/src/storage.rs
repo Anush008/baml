@@ -127,6 +127,62 @@ impl Storage {
         Ok(Some(serde_json::from_str(&text)?))
     }
 
+    /// Load all candidates currently on disk, sorted by id ascending.
+    ///
+    /// Scans `candidates/candidate_<N>.json` files and deserialises each.
+    /// Entries that fail to parse are skipped with a warning suppressed
+    /// (callers get a best-effort view — used by the TUI while the run is
+    /// still writing).
+    pub fn load_candidates(&self) -> Result<Vec<Candidate>> {
+        let dir = self.run_dir.join("candidates");
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&dir)
+            .with_context(|| format!("failed to read candidates dir: {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let name = match path.file_name().and_then(|s| s.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            if !name.starts_with("candidate_") || !name.ends_with(".json") {
+                continue;
+            }
+            let text = match fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if let Ok(c) = serde_json::from_str::<Candidate>(&text) {
+                out.push(c);
+            }
+        }
+        out.sort_by_key(|c| c.id);
+        Ok(out)
+    }
+
+    /// Load the run configuration if present.
+    pub fn load_config(&self) -> Result<RunConfig> {
+        let path = self.run_dir.join("config.json");
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let config = serde_json::from_str(&text)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        Ok(config)
+    }
+
+    /// Load the summary of a completed run if `final_results.json` exists.
+    pub fn load_final_results(&self) -> Result<Option<FinalResults>> {
+        let path = self.run_dir.join("final_results.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text = fs::read_to_string(&path)?;
+        Ok(Some(serde_json::from_str(&text)?))
+    }
+
     pub fn save_checkpoint(&self, state: &RunState) -> Result<()> {
         let path = self.run_dir.join("state.json");
         fs::write(&path, serde_json::to_string_pretty(state)?)?;
@@ -175,16 +231,86 @@ impl Storage {
     }
 
     pub fn save_final_results(&self, best_id: usize, scores: &CandidateScores) -> Result<()> {
-        let blob = serde_json::json!({
-            "best_candidate_id": best_id,
-            "scores": scores,
-        });
+        let blob = FinalResults {
+            best_candidate_id: best_id,
+            scores: scores.clone(),
+        };
         fs::write(
             self.run_dir.join("final_results.json"),
             serde_json::to_string_pretty(&blob)?,
         )?;
         Ok(())
     }
+
+    /// Record a fatal error message so a live TUI can surface it and exit
+    /// cleanly. Stored at `error.txt` in the run dir.
+    pub fn write_error(&self, message: &str) -> Result<()> {
+        fs::write(self.run_dir.join("error.txt"), message)?;
+        Ok(())
+    }
+
+    /// Read the fatal error message written by `write_error`, if any.
+    pub fn load_error(&self) -> Option<String> {
+        fs::read_to_string(self.run_dir.join("error.txt")).ok()
+    }
+}
+
+/// Summary persisted to `final_results.json` once a run finishes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FinalResults {
+    pub best_candidate_id: usize,
+    pub scores: CandidateScores,
+}
+
+// =============================================================================
+// File-based IPC between the orchestrator and the TUI
+// =============================================================================
+//
+// The TUI runs in a separate OS thread and cannot share memory with the
+// orchestrator's async loop. It signals two things through files inside the
+// run directory:
+//
+// * `stop_requested` — empty marker file; the orchestrator polls for it
+//   each iteration and halts if present.
+// * `apply_request.json` — `{ "candidate_id": N }`; the CLI reads this
+//   after the orchestrator returns to decide which candidate to write
+//   back into `baml_src/`.
+
+/// Write an "apply this candidate" request plus a stop marker so the
+/// orchestrator aborts at its next poll and the caller can pick up the
+/// selected candidate id from disk.
+pub fn write_apply_request(storage_path: &Path, candidate_id: usize) -> Result<()> {
+    let request_path = storage_path.join("apply_request.json");
+    let content = serde_json::json!({ "candidate_id": candidate_id });
+    fs::write(&request_path, serde_json::to_string_pretty(&content)?)?;
+    write_stop_request(storage_path)?;
+    Ok(())
+}
+
+/// Touch `stop_requested` so the orchestrator will halt at its next check.
+pub fn write_stop_request(storage_path: &Path) -> Result<()> {
+    fs::write(storage_path.join("stop_requested"), "stop")?;
+    Ok(())
+}
+
+/// True if `stop_requested` exists in the run directory.
+pub fn is_stop_requested(storage_path: &Path) -> bool {
+    storage_path.join("stop_requested").exists()
+}
+
+/// Read an apply request. Deletes both the request file and the stop
+/// marker on success, so subsequent calls return `None`.
+pub fn read_apply_request(storage_path: &Path) -> Option<usize> {
+    let request_path = storage_path.join("apply_request.json");
+    if !request_path.exists() {
+        return None;
+    }
+    let content = fs::read_to_string(&request_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let candidate_id = value.get("candidate_id")?.as_u64()? as usize;
+    let _ = fs::remove_file(&request_path);
+    let _ = fs::remove_file(storage_path.join("stop_requested"));
+    Some(candidate_id)
 }
 
 /// Produce a multi-file unified diff comparing `base` to `modified`.

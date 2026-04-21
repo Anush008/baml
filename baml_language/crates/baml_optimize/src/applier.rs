@@ -4,20 +4,20 @@
 //! The approach is regex/text-based (not IR-driven). We locate `function
 //! NAME` in each source file, walk forward to its `prompt` keyword, parse
 //! the raw-string delimiters (`#"..."#`, `##"..."##`, etc.), and splice in
-//! the candidate's new prompt text between them.
+//! the candidate's new prompt text between them. In parallel we rewrite
+//! class-level metadata: `/// ...` docstrings above `class <Name>` for
+//! `class.description`, and per-field `@description(...)` / `@alias(...)`
+//! attributes inside the class body.
 //!
 //! This mirrors the fallback path in
 //! `engine/baml-runtime/src/optimize/applier.rs::replace_prompt_in_file`.
-//! Schema (class/enum) rewriting is intentionally deferred — modern GEPA
-//! prompts rarely require schema changes, and doing it reliably needs IR
-//! span access we don't have yet.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::candidate::{Candidate, ClassDefinition, OptimizableFunction};
+use crate::candidate::{Candidate, ClassDefinition, OptimizableFunction, SchemaFieldDefinition};
 
 /// Applies candidate changes to produce modified source files.
 pub struct Applier {
@@ -66,6 +66,10 @@ fn apply_prompt_change(source: &str, func: &OptimizableFunction) -> Option<Strin
             current = rewrite;
             changed = true;
         }
+        if let Some(rewrite) = apply_field_attrs(&current, class) {
+            current = rewrite;
+            changed = true;
+        }
     }
 
     if changed { Some(current) } else { None }
@@ -73,9 +77,6 @@ fn apply_prompt_change(source: &str, func: &OptimizableFunction) -> Option<Strin
 
 /// If `class.description` is set, add or replace a `///` doc-comment block
 /// immediately above the `class <ClassName>` line in `source`.
-///
-/// Per-field attributes (`@description`, `@alias`) are deferred — handling
-/// them reliably needs IR span access we don't have yet.
 fn apply_class_description(source: &str, class: &ClassDefinition) -> Option<String> {
     let description = class.description.as_ref()?;
     let class_start = find_class_start(source, &class.class_name)?;
@@ -100,6 +101,282 @@ fn apply_class_description(source: &str, class: &ClassDefinition) -> Option<Stri
     out.push_str(&new_doc);
     out.push_str(&source[doc_end..]);
     Some(out)
+}
+
+/// Rewrite `@description` / `@alias` attributes on fields inside
+/// `class <ClassName> { ... }` to match the candidate's field metadata.
+///
+/// For each field whose `description` or `alias` is `Some(...)`, the
+/// corresponding attribute on the source field is replaced (if present)
+/// or appended to the end of the field's declaration line (if absent).
+/// `None` on a candidate field means "leave the source unchanged" — we
+/// don't strip user-authored annotations the LLM simply didn't mention.
+///
+/// Returns `Some(new_source)` only when at least one field line actually
+/// changed, so callers can tell a no-op from a real edit.
+fn apply_field_attrs(source: &str, class: &ClassDefinition) -> Option<String> {
+    let any_attrs = class
+        .fields
+        .iter()
+        .any(|f| f.description.is_some() || f.alias.is_some());
+    if !any_attrs {
+        return None;
+    }
+
+    let class_start = find_class_start(source, &class.class_name)?;
+    let rel_brace = source[class_start..].find('{')?;
+    let body_start = class_start + rel_brace + 1;
+    let body_end = find_matching_close_brace(source, body_start)?;
+
+    let body = &source[body_start..body_end];
+    let fields_by_name: HashMap<&str, &SchemaFieldDefinition> = class
+        .fields
+        .iter()
+        .map(|f| (f.field_name.as_str(), f))
+        .collect();
+
+    let mut new_body = String::with_capacity(body.len());
+    let mut changed = false;
+
+    // Walk the class body line by line. `split_inclusive('\n')` preserves
+    // each line's terminator, so reassembly is exact even if the file has
+    // no trailing newline.
+    for segment in body.split_inclusive('\n') {
+        let trim_start_offset = segment.len() - segment.trim_start().len();
+        let rest = &segment[trim_start_offset..];
+
+        // Blank, comment, attribute continuation, or docstring lines are
+        // never a field declaration — pass them through untouched.
+        let first_non_ws = rest.trim_start();
+        if first_non_ws.is_empty()
+            || first_non_ws.starts_with("//")
+            || first_non_ws.starts_with('@')
+            || first_non_ws.starts_with('{')
+            || first_non_ws.starts_with('}')
+        {
+            new_body.push_str(segment);
+            continue;
+        }
+
+        let name_end = rest
+            .char_indices()
+            .find(|(_, c)| !is_ident_char(*c))
+            .map(|(i, _)| i)
+            .unwrap_or(rest.len());
+        let name = &rest[..name_end];
+
+        if let Some(field) = fields_by_name.get(name) {
+            let rewritten = rewrite_field_line(
+                segment,
+                field.description.as_deref(),
+                field.alias.as_deref(),
+            );
+            if rewritten != segment {
+                changed = true;
+            }
+            new_body.push_str(&rewritten);
+        } else {
+            new_body.push_str(segment);
+        }
+    }
+
+    if !changed {
+        return None;
+    }
+
+    let mut out = String::with_capacity(source.len());
+    out.push_str(&source[..body_start]);
+    out.push_str(&new_body);
+    out.push_str(&source[body_end..]);
+    Some(out)
+}
+
+/// Walk forward from `from` counting brace nesting and return the index
+/// of the `}` that closes the block opened just before `from`.
+fn find_matching_close_brace(source: &str, from: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut depth: i32 = 1;
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Rewrite a single field declaration line to carry the requested
+/// `@description` / `@alias` attributes. `None` for an attribute leaves
+/// any existing version of it alone. Preserves a trailing `// comment`
+/// and the line's terminating newline.
+fn rewrite_field_line(
+    segment: &str,
+    description: Option<&str>,
+    alias: Option<&str>,
+) -> String {
+    let (code, tail) = if let Some(stripped) = segment.strip_suffix('\n') {
+        (stripped, "\n")
+    } else {
+        (segment, "")
+    };
+    let (body, comment) = split_trailing_comment(code);
+    let mut body = body.to_string();
+    if let Some(desc) = description {
+        body = set_attr(&body, "description", desc);
+    }
+    if let Some(a) = alias {
+        body = set_attr(&body, "alias", a);
+    }
+
+    let mut out = String::with_capacity(body.len() + comment.len() + tail.len());
+    out.push_str(&body);
+    out.push_str(comment);
+    out.push_str(tail);
+    out
+}
+
+/// Split `code` at the start of a trailing `//` comment, skipping over
+/// `//` that appears inside a double-quoted string. Returns
+/// `(code_body, comment_with_leading_whitespace)`.
+fn split_trailing_comment(code: &str) -> (&str, &str) {
+    let bytes = code.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            let mut start = i;
+            while start > 0 && matches!(bytes[start - 1], b' ' | b'\t') {
+                start -= 1;
+            }
+            return (&code[..start], &code[start..]);
+        }
+        i += 1;
+    }
+    (code, "")
+}
+
+/// Set (or replace) the `@<name>("<value>")` attribute on a single line.
+/// If the attribute already exists, its argument list is replaced with
+/// the new value; otherwise the attribute is appended after any existing
+/// attributes on the line.
+fn set_attr(line: &str, name: &str, value: &str) -> String {
+    let needle = format!("@{name}(");
+    if let Some(start) = find_attr_occurrence(line, name) {
+        let open = start + needle.len();
+        let close = find_matching_close_paren(line, open).unwrap_or(line.len());
+        let mut out = String::with_capacity(line.len() + value.len());
+        out.push_str(&line[..open]);
+        out.push('"');
+        out.push_str(&escape_baml_string(value));
+        out.push('"');
+        out.push_str(&line[close..]);
+        out
+    } else {
+        let trimmed_end = line.trim_end().len();
+        let trailing_ws = &line[trimmed_end..];
+        let mut out = String::with_capacity(line.len() + 20 + value.len());
+        out.push_str(&line[..trimmed_end]);
+        out.push(' ');
+        out.push_str(&needle);
+        out.push('"');
+        out.push_str(&escape_baml_string(value));
+        out.push('"');
+        out.push(')');
+        out.push_str(trailing_ws);
+        out
+    }
+}
+
+/// Find `@<name>(` in `line`, skipping `@@<name>(` block-level attributes
+/// (which don't live on field lines anyway, but we defend against them).
+fn find_attr_occurrence(line: &str, name: &str) -> Option<usize> {
+    let needle = format!("@{name}(");
+    let mut search_from = 0;
+    while let Some(rel) = line[search_from..].find(&needle) {
+        let abs = search_from + rel;
+        // `@@description(...)` is a block-level attribute; skip over it.
+        if abs > 0 && line.as_bytes()[abs - 1] == b'@' {
+            search_from = abs + needle.len();
+            continue;
+        }
+        return Some(abs);
+    }
+    None
+}
+
+/// Given a position just after an opening `(`, return the matching `)`
+/// index. Treats `"..."` as opaque so parens inside string args don't
+/// throw off the count.
+fn find_matching_close_paren(line: &str, from: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut depth: i32 = 1;
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Escape the subset of characters that would otherwise terminate a BAML
+/// attribute string literal.
+fn escape_baml_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
 }
 
 /// Find `class <name>` (optional generic params) as a word-boundary match.
@@ -659,6 +936,162 @@ function ExtractSubject(x: string) -> string {
         assert_eq!(
             out,
             "/// Line one.\n/// Line two.\nclass Person {\n  name string\n}\n"
+        );
+    }
+
+    fn class_with_fields(name: &str, fields: Vec<SchemaFieldDefinition>) -> ClassDefinition {
+        ClassDefinition {
+            class_name: name.to_string(),
+            description: None,
+            fields,
+        }
+    }
+
+    fn field(name: &str, ty: &str, desc: Option<&str>, alias: Option<&str>) -> SchemaFieldDefinition {
+        SchemaFieldDefinition {
+            field_name: name.to_string(),
+            field_type: ty.to_string(),
+            description: desc.map(str::to_string),
+            alias: alias.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn adds_description_to_field_without_one() {
+        let src = "class Person {\n  name string\n  age int?\n}\n";
+        let class = class_with_fields(
+            "Person",
+            vec![
+                field("name", "string", Some("The person's name"), None),
+                field("age", "int?", None, None),
+            ],
+        );
+        let out = apply_field_attrs(src, &class).expect("should rewrite");
+        assert!(
+            out.contains("  name string @description(\"The person's name\")\n"),
+            "got:\n{out}"
+        );
+        assert!(out.contains("  age int?\n"), "age should be untouched:\n{out}");
+    }
+
+    #[test]
+    fn replaces_existing_description_on_field() {
+        let src = "class Person {\n  name string @description(\"old\")\n}\n";
+        let class = class_with_fields(
+            "Person",
+            vec![field("name", "string", Some("new"), None)],
+        );
+        let out = apply_field_attrs(src, &class).expect("should rewrite");
+        assert!(out.contains("@description(\"new\")"), "got:\n{out}");
+        assert!(!out.contains("\"old\""), "old value should be gone:\n{out}");
+    }
+
+    #[test]
+    fn adds_both_description_and_alias() {
+        let src = "class Person {\n  name string\n}\n";
+        let class = class_with_fields(
+            "Person",
+            vec![field(
+                "name",
+                "string",
+                Some("The full name"),
+                Some("full_name"),
+            )],
+        );
+        let out = apply_field_attrs(src, &class).expect("should rewrite");
+        assert!(out.contains("@description(\"The full name\")"), "got:\n{out}");
+        assert!(out.contains("@alias(\"full_name\")"), "got:\n{out}");
+    }
+
+    #[test]
+    fn no_op_when_description_matches_existing() {
+        let src = "class Person {\n  name string @description(\"same\")\n}\n";
+        let class = class_with_fields(
+            "Person",
+            vec![field("name", "string", Some("same"), None)],
+        );
+        assert!(apply_field_attrs(src, &class).is_none());
+    }
+
+    #[test]
+    fn preserves_other_attributes_on_field() {
+        let src = "class Person {\n  age int? @check(AgeNonNeg, {{ this == null or this >= 0 }})\n}\n";
+        let class = class_with_fields(
+            "Person",
+            vec![field("age", "int?", Some("The age"), None)],
+        );
+        let out = apply_field_attrs(src, &class).expect("should rewrite");
+        assert!(out.contains("@check(AgeNonNeg"), "got:\n{out}");
+        assert!(out.contains("@description(\"The age\")"), "got:\n{out}");
+    }
+
+    #[test]
+    fn escapes_quotes_in_attribute_value() {
+        let src = "class Person {\n  name string\n}\n";
+        let class = class_with_fields(
+            "Person",
+            vec![field("name", "string", Some("a \"quoted\" name"), None)],
+        );
+        let out = apply_field_attrs(src, &class).expect("should rewrite");
+        assert!(
+            out.contains("@description(\"a \\\"quoted\\\" name\")"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn preserves_trailing_comment_on_field_line() {
+        let src = "class Person {\n  name string // the main name\n}\n";
+        let class = class_with_fields(
+            "Person",
+            vec![field("name", "string", Some("The name"), None)],
+        );
+        let out = apply_field_attrs(src, &class).expect("should rewrite");
+        assert!(
+            out.contains("  name string @description(\"The name\") // the main name\n"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn only_touches_named_fields() {
+        let src = "class Person {\n  name string\n  age int?\n  nickname string?\n}\n";
+        let class = class_with_fields(
+            "Person",
+            vec![field("age", "int?", Some("Age in years"), None)],
+        );
+        let out = apply_field_attrs(src, &class).expect("should rewrite");
+        // Only age gets the new attribute.
+        assert!(
+            out.contains("  age int? @description(\"Age in years\")\n"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("  name string\n"),
+            "name should be unchanged:\n{out}"
+        );
+        assert!(
+            out.contains("  nickname string?\n"),
+            "nickname should be unchanged:\n{out}"
+        );
+    }
+
+    #[test]
+    fn does_not_touch_other_class() {
+        let src = "class Other {\n  name string\n}\n\nclass Person {\n  name string\n}\n";
+        let class = class_with_fields(
+            "Person",
+            vec![field("name", "string", Some("A person's name"), None)],
+        );
+        let out = apply_field_attrs(src, &class).expect("should rewrite");
+        // Only Person's `name` should get the attribute.
+        assert!(
+            out.contains("class Person {\n  name string @description(\"A person's name\")\n"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("class Other {\n  name string\n}"),
+            "Other.name should be unchanged:\n{out}"
         );
     }
 }

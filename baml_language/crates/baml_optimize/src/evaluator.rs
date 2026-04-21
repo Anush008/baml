@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use bex_engine::{
     BexEngine, BexExternalValue, CallId, FunctionCallContextBuilder, test_arg_to_external,
 };
@@ -16,7 +16,7 @@ use bex_events::Collector;
 use tokio::sync::Semaphore;
 
 use crate::candidate::CandidateScores;
-use crate::discovery::DiscoveredTest;
+use crate::discovery::{DiscoveredTest, TestKind, collect_registry_handle};
 
 /// Result of a single test execution.
 #[derive(Clone, Debug)]
@@ -34,6 +34,12 @@ pub struct TestResult {
     pub input_args: indexmap::IndexMap<String, BexExternalValue>,
     /// Function return value on success, `None` on failure.
     pub output: Option<BexExternalValue>,
+    /// Source text of the `test "..." { ... }` block, when the test's
+    /// path resolved statically (see `testset_filter`). Fed into
+    /// `ReflectiveExample.test_source` so the reflection LLM can see
+    /// what inputs the test passes and what it asserts. `None` for
+    /// dynamic testsets and legacy tests.
+    pub test_source: Option<String>,
 }
 
 /// Runs tests in parallel and aggregates scores.
@@ -49,12 +55,26 @@ impl Evaluator {
 
     /// Evaluate all tests and return aggregated scores plus individual results.
     ///
-    /// Tests run concurrently, bounded by `self.parallel`.
+    /// Tests run concurrently, bounded by `self.parallel`. For new-style
+    /// testset tests ([`TestKind::Testset`]), a shared `TestRegistry`
+    /// handle is collected once from the engine and reused across every
+    /// test's `TestRegistry.run_test` call.
     pub async fn evaluate(
         &self,
         engine: Arc<BexEngine>,
         tests: &[DiscoveredTest],
     ) -> Result<(CandidateScores, Vec<TestResult>)> {
+        let needs_registry = tests
+            .iter()
+            .any(|t| matches!(t.kind, TestKind::Testset { .. }));
+        let registry = if needs_registry {
+            collect_registry_handle(&engine)
+                .await
+                .context("failed to materialize testset registry")?
+        } else {
+            None
+        };
+
         let semaphore = Arc::new(Semaphore::new(self.parallel));
         let mut handles = Vec::with_capacity(tests.len());
 
@@ -64,13 +84,37 @@ impl Evaluator {
             let func_name = test.function_name.clone();
             let test_name = test.test_name.clone();
             let testset_name = test.testset_name.clone();
+            let kind = test.kind.clone();
+            let test_source = test.test_source.clone();
+            let registry = registry.clone();
 
             handles.push(tokio::spawn(async move {
                 let _permit = semaphore
                     .acquire_owned()
                     .await
                     .map_err(|e| anyhow!("semaphore closed: {e}"))?;
-                run_single_test(&engine, &func_name, &test_name, testset_name).await
+                match kind {
+                    TestKind::Legacy => {
+                        run_legacy_test(&engine, &func_name, &test_name, testset_name).await
+                    }
+                    TestKind::Testset { full_path } => {
+                        let registry = registry.ok_or_else(|| {
+                            anyhow!(
+                                "testset test {full_path} requires a registry but none was built"
+                            )
+                        })?;
+                        run_testset_test(
+                            &engine,
+                            &registry,
+                            &full_path,
+                            &func_name,
+                            &test_name,
+                            testset_name,
+                            test_source,
+                        )
+                        .await
+                    }
+                }
             }));
         }
 
@@ -84,7 +128,10 @@ impl Evaluator {
     }
 }
 
-async fn run_single_test(
+/// Run a legacy `test Foo { functions [Bar] args { ... } @@assert(...) }`
+/// style test: call the function directly, capture the return value, and
+/// evaluate Jinja `@@assert` expressions against the result.
+async fn run_legacy_test(
     engine: &Arc<BexEngine>,
     func_name: &str,
     test_name: &str,
@@ -154,7 +201,139 @@ async fn run_single_test(
         output_tokens: usage.output_tokens,
         input_args,
         output,
+        test_source: None,
     })
+}
+
+/// Run a new-style testset test by delegating to the BAML runtime's
+/// `testing.TestRegistry.run_test`. The test body (function call +
+/// `assert.*` calls) executes inside the registry; we recover only the
+/// `TestReport.outcome` string (`"pass" | "fail" | "error"`), plus any
+/// error from the engine itself. No function return value is exposed to
+/// the optimizer, so reflection examples built from failures carry just
+/// the test name and error message.
+async fn run_testset_test(
+    engine: &Arc<BexEngine>,
+    registry: &BexExternalValue,
+    full_path: &str,
+    func_name: &str,
+    test_name: &str,
+    testset_name: Option<String>,
+    test_source: Option<String>,
+) -> Result<TestResult> {
+    let collector = Arc::new(Collector::new("optimize".into()));
+    let ctx = FunctionCallContextBuilder::new(CallId::next())
+        .with_collectors(vec![collector.clone()])
+        .build();
+
+    let start = Instant::now();
+    let call_result = engine
+        .call_function(
+            "testing.TestRegistry.run_test",
+            vec![
+                registry.clone(),
+                BexExternalValue::String(full_path.to_string()),
+            ],
+            ctx,
+            true,
+        )
+        .await;
+    #[allow(clippy::cast_precision_loss)]
+    let latency_ms = start.elapsed().as_micros() as f64 / 1000.0;
+
+    let usage = collector.usage();
+    let (passed, error) = match call_result {
+        Ok(report) => {
+            let outcome = extract_outcome(&report).unwrap_or_else(|| "unknown".to_string());
+            if outcome == "pass" {
+                (true, None)
+            } else {
+                (
+                    false,
+                    Some(format!(
+                        "testset test outcome: {outcome}{}",
+                        extract_test_message(&report)
+                            .map(|m| format!(" ({m})"))
+                            .unwrap_or_default()
+                    )),
+                )
+            }
+        }
+        Err(e) => (false, Some(format!("{e:?}"))),
+    };
+
+    Ok(TestResult {
+        function_name: func_name.to_string(),
+        test_name: test_name.to_string(),
+        testset_name,
+        passed,
+        error,
+        latency_ms,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        // Testset tests embed their function call inside the test body,
+        // so we don't have args/return to surface to reflection.
+        input_args: indexmap::IndexMap::new(),
+        output: None,
+        test_source,
+    })
+}
+
+/// Pull `TestReport.outcome` out of the serialized value returned by
+/// `testing.TestRegistry.run_test`. Defensive about union wrappers that
+/// may be applied when crossing the FFI boundary.
+fn extract_outcome(value: &BexExternalValue) -> Option<String> {
+    let v = unwrap_union(value);
+    if let BexExternalValue::Instance { fields, .. } = v {
+        if let Some(outcome) = fields.get("outcome") {
+            return as_string(unwrap_union(outcome)).map(str::to_string);
+        }
+    }
+    None
+}
+
+/// Try to extract a human-readable failure message from the `runs` array
+/// inside a `TestReport`. Used to enrich the error field with e.g. the
+/// panic message from `baml.sys.panic` so reflection gets actionable text.
+fn extract_test_message(value: &BexExternalValue) -> Option<String> {
+    let v = unwrap_union(value);
+    let fields = match v {
+        BexExternalValue::Instance { fields, .. } => fields,
+        _ => return None,
+    };
+    let runs = fields.get("runs")?;
+    let runs = unwrap_union(runs);
+    let items = match runs {
+        BexExternalValue::Array { items, .. } => items,
+        _ => return None,
+    };
+    for run in items {
+        let run = unwrap_union(run);
+        if let BexExternalValue::Instance { fields, .. } = run {
+            if let Some(msg) = fields.get("message").and_then(as_string) {
+                return Some(msg.to_string());
+            }
+            if let Some(err) = fields.get("error").and_then(as_string) {
+                return Some(err.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn unwrap_union(value: &BexExternalValue) -> &BexExternalValue {
+    match value {
+        BexExternalValue::Union { value, .. } => unwrap_union(value),
+        other => other,
+    }
+}
+
+fn as_string(value: &BexExternalValue) -> Option<&str> {
+    match value {
+        BexExternalValue::String(s) => Some(s.as_str()),
+        BexExternalValue::Union { value, .. } => as_string(value),
+        _ => None,
+    }
 }
 
 /// Run every `@@assert` attached to a test against the function result.
@@ -284,6 +463,7 @@ mod tests {
             output_tokens: output,
             input_args: indexmap::IndexMap::new(),
             output: None,
+            test_source: None,
         }
     }
 
