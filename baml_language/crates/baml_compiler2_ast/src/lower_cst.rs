@@ -18,7 +18,7 @@ use crate::{
         AstSourceMap, BuiltinKind, ConfigItemDef, EnumDef, Expr, ExprBody, ExprId, FieldDef,
         FunctionBodyDef, FunctionDef, GeneratorDef, Interpolation, Item, LetDef, LetOrigin,
         LlmBodyDef, Param, RawAttribute, RawAttributeArg, RawPrompt, SpannedTypeExpr,
-        TemplateStringDef, TestDef, TypeAliasDef, VariantDef,
+        TemplateStringDef, TestArgValue, TestDef, TypeAliasDef, VariantDef,
     },
     companions::expand_companions,
     lower_expr_body, lower_type_expr,
@@ -899,17 +899,109 @@ fn lower_test(node: &SyntaxNode, diags: &mut Vec<LoweringDiagnostic>) -> Option<
     };
 
     let test_name = name_token.text().to_string();
-    let config_items = test
-        .config_block()
-        .map(|cb| lower_config_block(&cb, "test", &test_name, diags))
+    let config_block = test.config_block();
+    let config_items = config_block
+        .as_ref()
+        .map(|cb| lower_config_block(cb, "test", &test_name, diags))
+        .unwrap_or_default();
+    let args = config_block
+        .as_ref()
+        .and_then(|cb| cb.items().find(|item| item.matches_key("args")))
+        .and_then(|item| item.nested_block())
+        .map(|block| lower_test_arg_block(&block))
         .unwrap_or_default();
 
     Some(TestDef {
         name: Name::new(&test_name),
         config_items,
+        args,
         span: node.text_range(),
         name_span: name_token.text_range(),
     })
+}
+
+/// Lower a nested `args { ... }` config block to ordered `(Name, TestArgValue)` pairs.
+fn lower_test_arg_block(block: &ast::ConfigBlock) -> Vec<(Name, TestArgValue)> {
+    block
+        .items()
+        .filter_map(|item| {
+            let key_token = item.key()?;
+            let value = lower_test_arg_value(&item);
+            Some((Name::new(key_token.text()), value))
+        })
+        .collect()
+}
+
+/// Lower a single CST `ConfigItem` to a `TestArgValue`.
+fn lower_test_arg_value(item: &ast::ConfigItem) -> TestArgValue {
+    // 1. Nested block → Map
+    if let Some(nested) = item.nested_block() {
+        let entries: Vec<(std::string::String, TestArgValue)> = nested
+            .items()
+            .filter_map(|child| {
+                let key_token = child.key()?;
+                Some((key_token.text().to_string(), lower_test_arg_value(&child)))
+            })
+            .collect();
+        return TestArgValue::Map(entries);
+    }
+
+    // 2. Array literal → Array. `array_string_elements` covers the common
+    //    case of string/ident elements; non-string entries are left as `Null`
+    //    placeholders since tests rarely nest complex values inside arrays.
+    if item.is_array() {
+        let elements = item
+            .array_string_elements()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(maybe_str, _range)| match maybe_str {
+                Some(s) => TestArgValue::String(s.trim_matches('"').to_string()),
+                None => TestArgValue::Null,
+            })
+            .collect();
+        return TestArgValue::Array(elements);
+    }
+
+    // 3. Scalar value. `null` first so it doesn't fall through to `String`.
+    let Some(cv_node) = item.config_value_node() else {
+        return TestArgValue::Null;
+    };
+
+    let is_int = cv_node
+        .descendants_with_tokens()
+        .filter_map(rowan::NodeOrToken::into_token)
+        .filter(|t| !matches!(t.kind(), SyntaxKind::WHITESPACE | SyntaxKind::NEWLINE))
+        .all(|t| t.kind() == SyntaxKind::INTEGER_LITERAL);
+    if is_int {
+        if let Some(v) = item.value_int() {
+            return TestArgValue::Int(v);
+        }
+    }
+
+    let is_float = cv_node
+        .descendants_with_tokens()
+        .filter_map(rowan::NodeOrToken::into_token)
+        .filter(|t| !matches!(t.kind(), SyntaxKind::WHITESPACE | SyntaxKind::NEWLINE))
+        .all(|t| t.kind() == SyntaxKind::FLOAT_LITERAL);
+    if is_float {
+        if let Some(text) = item.config_value().and_then(|cv| cv.scalar_text()) {
+            if let Ok(v) = text.parse::<f64>() {
+                return TestArgValue::FloatBits(v.to_bits());
+            }
+        }
+    }
+
+    let text = item
+        .config_value()
+        .and_then(|cv| cv.scalar_text())
+        .unwrap_or_default();
+
+    match text.as_str() {
+        "true" => TestArgValue::Bool(true),
+        "false" => TestArgValue::Bool(false),
+        "null" => TestArgValue::Null,
+        _ => TestArgValue::String(text.trim_matches('"').to_string()),
+    }
 }
 
 /// Extract the name expression element from a `TEST_EXPR_DEF` or `TESTSET_DEF` node.

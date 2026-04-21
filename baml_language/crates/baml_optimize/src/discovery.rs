@@ -40,16 +40,17 @@ pub fn discover_all_tests(db: &ProjectDatabase, function_filter: &[String]) -> V
         for (_id, test) in &item_tree.tests {
             for func_ref in &test.function_refs {
                 let func_name = func_ref.to_string();
+                if func_name.is_empty() {
+                    continue;
+                }
                 let test_name = test.name.to_string();
 
-                // Apply function filter
                 if !function_filter.is_empty()
                     && !function_filter.iter().any(|f| func_name.contains(f.as_str()))
                 {
                     continue;
                 }
 
-                // Deduplicate by (function, test) pair
                 let key = (func_name.clone(), test_name.clone());
                 if seen.contains(&key) {
                     continue;
@@ -59,7 +60,7 @@ pub fn discover_all_tests(db: &ProjectDatabase, function_filter: &[String]) -> V
                 tests.push(DiscoveredTest {
                     function_name: func_name,
                     test_name,
-                    testset_name: None, // Old-style tests don't have testsets
+                    testset_name: None,
                     file_path: file_path.clone(),
                 });
             }

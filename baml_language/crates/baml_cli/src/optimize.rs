@@ -61,6 +61,19 @@ impl OptimizeArgs {
             eprintln!("No .baml files found in {}", from.display());
             return Ok(crate::ExitCode::Other);
         }
+        if self.verbose {
+            println!(
+                "Discovered {} .baml file(s) under {}",
+                baml_files.len(),
+                from.display()
+            );
+            for (i, p) in baml_files.iter().enumerate().take(10) {
+                println!("  [{i}] {}", p.display());
+            }
+            if baml_files.len() > 10 {
+                println!("  ... and {} more", baml_files.len() - 10);
+            }
+        }
         for file_path in &baml_files {
             let content = std::fs::read_to_string(file_path)
                 .with_context(|| format!("failed to read {}", file_path.display()))?;
@@ -75,9 +88,13 @@ impl OptimizeArgs {
             .filter(|d| d.severity == Severity::Error)
             .collect();
         if !errors.is_empty() {
+            const MAX_SHOWN: usize = 20;
             eprintln!("Compilation errors found ({}):", errors.len());
-            for d in &errors {
+            for d in errors.iter().take(MAX_SHOWN) {
                 eprintln!("  error: {}", d.message);
+            }
+            if errors.len() > MAX_SHOWN {
+                eprintln!("  ... and {} more errors", errors.len() - MAX_SHOWN);
             }
             return Ok(crate::ExitCode::Other);
         }

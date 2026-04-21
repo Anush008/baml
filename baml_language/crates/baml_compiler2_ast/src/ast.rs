@@ -863,10 +863,30 @@ pub struct ConfigItemDef {
     pub span: TextRange,
 }
 
+/// Test argument value parsed from the `args { ... }` block in a `test` item.
+///
+/// Mirrors the compiler2 HIR's `TestArgValue` shape but lives in the AST so
+/// the HIR can construct its own value without reaching back into the CST.
+/// Floats are stored as bit patterns so this enum is `Eq`/`Hash`-friendly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TestArgValue {
+    Null,
+    Int(i64),
+    /// Float stored as raw bits (`f64::to_bits(value)`).
+    FloatBits(u64),
+    Bool(bool),
+    String(std::string::String),
+    Array(Vec<TestArgValue>),
+    Map(Vec<(std::string::String, TestArgValue)>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestDef {
     pub name: Name,
     pub config_items: Vec<ConfigItemDef>,
+    /// Args parsed from the nested `args { ... }` block, in source order.
+    /// Empty if the test has no `args` block.
+    pub args: Vec<(Name, TestArgValue)>,
     pub span: TextRange,
     pub name_span: TextRange,
 }

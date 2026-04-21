@@ -461,20 +461,37 @@ impl ItemTree {
     pub fn alloc_test(&mut self, t: &ast::TestDef) -> LocalItemId<TestMarker> {
         let id = self.alloc_id(ItemKind::Test, &t.name);
         // Extract function_refs from config_items (key "functions" or "function")
+        //
+        // Array syntax `functions [A, B]` is lowered to a single comma-joined
+        // value with the outer brackets still attached (`"[A, B]"`). Strip the
+        // brackets and whitespace per element so downstream consumers see bare
+        // names.
         let function_refs = t
             .config_items
             .iter()
             .filter(|item| item.key.as_str() == "functions" || item.key.as_str() == "function")
             .flat_map(|item| {
-                // Values may be comma-separated or a single name
                 item.value
                     .split(',')
-                    .map(|s| Name::new(s.trim().trim_matches('"')))
+                    .map(|s| {
+                        let cleaned = s
+                            .trim()
+                            .trim_start_matches('[')
+                            .trim_end_matches(']')
+                            .trim()
+                            .trim_matches('"');
+                        Name::new(cleaned)
+                    })
+                    .filter(|n| !n.is_empty())
                     .collect::<Vec<_>>()
             })
             .collect();
-        // Args come from config_items with key "args" — store raw; complex parsing skipped
-        let args = Vec::new();
+        // Args come pre-parsed from the AST layer's `args { ... }` block walk.
+        let args: Vec<(Name, TestArgValue)> = t
+            .args
+            .iter()
+            .map(|(k, v)| (k.clone(), convert_ast_test_arg_value(v)))
+            .collect();
         self.tests.insert(
             id,
             Test {
@@ -561,6 +578,29 @@ impl ItemTree {
             },
         );
         id
+    }
+}
+
+/// Convert an AST `TestArgValue` into the HIR's own `TestArgValue`.
+///
+/// The two enums carry the same shape; this isolates the AST→HIR conversion
+/// from `alloc_test` so the recursion stays readable.
+fn convert_ast_test_arg_value(v: &ast::TestArgValue) -> TestArgValue {
+    match v {
+        ast::TestArgValue::Null => TestArgValue::Null,
+        ast::TestArgValue::Int(i) => TestArgValue::Int(*i),
+        ast::TestArgValue::FloatBits(bits) => TestArgValue::FloatBits(*bits),
+        ast::TestArgValue::Bool(b) => TestArgValue::Bool(*b),
+        ast::TestArgValue::String(s) => TestArgValue::String(s.clone()),
+        ast::TestArgValue::Array(items) => {
+            TestArgValue::Array(items.iter().map(convert_ast_test_arg_value).collect())
+        }
+        ast::TestArgValue::Map(entries) => TestArgValue::Map(
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), convert_ast_test_arg_value(v)))
+                .collect(),
+        ),
     }
 }
 
