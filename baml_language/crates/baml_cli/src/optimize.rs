@@ -34,9 +34,25 @@ pub struct OptimizeArgs {
     pub parallel: usize,
 
     /// Objective weights, e.g. `"accuracy=0.8,tokens=0.2"` or
-    /// `"accuracy:testset_a=0.5"`
+    /// `"accuracy:testset_a=0.5"` (per-testset objective).
     #[arg(long, default_value = "accuracy=1.0")]
     pub weights: String,
+
+    /// Test filter pattern (same syntax as `baml-cli test -i`):
+    /// `FunctionName::TestName`, `FunctionName::`, `::TestName`, or
+    /// `Get*::*Bar` with wildcards. May be passed multiple times.
+    #[arg(long, short = 'i')]
+    pub include: Vec<String>,
+
+    /// Tests to exclude. Same syntax as `--include`; takes precedence.
+    #[arg(long, short = 'x')]
+    pub exclude: Vec<String>,
+
+    /// Resume from an existing run directory (e.g.
+    /// `.baml_optimize/run_20260421_101530`). Prints the saved summary and
+    /// exits — useful for inspecting a prior run.
+    #[arg(long)]
+    pub resume: Option<PathBuf>,
 
     /// Verbose progress output
     #[arg(long)]
@@ -50,6 +66,11 @@ impl OptimizeArgs {
     }
 
     async fn run_async(&self) -> Result<crate::ExitCode> {
+        // Resume short-circuits — we just print the saved summary and exit.
+        if let Some(resume_dir) = &self.resume {
+            return resume_from_run_dir(resume_dir);
+        }
+
         let from = std::fs::canonicalize(&self.from)
             .with_context(|| format!("Could not resolve path: {}", self.from.display()))?;
 
@@ -99,16 +120,43 @@ impl OptimizeArgs {
             return Ok(crate::ExitCode::Other);
         }
 
-        let tests = discover_all_tests(&db, &[self.function.clone()]);
+        let mut tests = discover_all_tests(&db, &[self.function.clone()]);
+        let discovered = tests.len();
+
+        // Apply include/exclude filters (shared with `baml-cli test`).
+        if !self.include.is_empty() || !self.exclude.is_empty() {
+            let filter = crate::test_filter::TestFilter::new(
+                self.include.iter().map(String::as_str),
+                self.exclude.iter().map(String::as_str),
+            );
+            tests.retain(|t| filter.includes(&t.function_name, &t.test_name));
+        }
+
         if tests.is_empty() {
-            eprintln!("No tests found for function: {}", self.function);
+            if discovered == 0 {
+                eprintln!("No tests found for function: {}", self.function);
+            } else {
+                eprintln!(
+                    "No tests selected for function '{}' — all {} were filtered out.",
+                    self.function, discovered
+                );
+            }
             return Ok(crate::ExitCode::Other);
         }
-        println!(
-            "Found {} tests for function '{}'",
-            tests.len(),
-            self.function
-        );
+        if tests.len() < discovered {
+            println!(
+                "Found {} tests for function '{}' ({} selected after filters)",
+                discovered,
+                self.function,
+                tests.len(),
+            );
+        } else {
+            println!(
+                "Found {} tests for function '{}'",
+                tests.len(),
+                self.function
+            );
+        }
 
         let initial_function = initial_function_from_db(&db, &self.function)
             .with_context(|| format!("failed to locate function '{}'", self.function))?;
@@ -177,4 +225,80 @@ impl OptimizeArgs {
 
         Ok(crate::ExitCode::Success)
     }
+}
+
+/// Inspect a prior run directory and print a summary of where it ended up.
+///
+/// Reads `config.json`, `state.json`, and (if present) `final_results.json`.
+/// The reflection loop is still stubbed in Phase 8, so "resume" today just
+/// surfaces the saved state — continuation across runs lands with the loop.
+fn resume_from_run_dir(run_dir: &std::path::Path) -> Result<crate::ExitCode> {
+    use baml_optimize::Storage;
+
+    let canon = std::fs::canonicalize(run_dir)
+        .with_context(|| format!("cannot resolve resume dir: {}", run_dir.display()))?;
+    let storage = Storage::load(canon.clone())
+        .with_context(|| format!("failed to open run dir: {}", canon.display()))?;
+
+    println!("=== Resuming from {} ===", storage.run_dir().display());
+
+    let config_path = storage.run_dir().join("config.json");
+    if let Ok(text) = std::fs::read_to_string(&config_path) {
+        match serde_json::from_str::<baml_optimize::RunConfig>(&text) {
+            Ok(cfg) => {
+                println!("Function: {}", cfg.function_name);
+                println!("Max iterations: {}", cfg.max_iterations);
+                println!("Parallel: {}", cfg.parallel);
+                if !cfg.objectives.is_empty() {
+                    println!("Objectives:");
+                    for o in &cfg.objectives {
+                        println!("  - {} ({}, weight={})", o.name, o.direction, o.weight);
+                    }
+                }
+            }
+            Err(e) => eprintln!("warning: could not parse config.json: {e}"),
+        }
+    } else {
+        eprintln!("warning: config.json not found in {}", storage.run_dir().display());
+    }
+
+    match storage.load_checkpoint()? {
+        Some(state) => {
+            println!(
+                "\nLast checkpoint: iteration {}, {} candidate(s), {} evaluation(s)",
+                state.current_iteration,
+                state.candidate_ids.len(),
+                state.total_evals,
+            );
+            println!(
+                "Pareto frontier: {:?}",
+                state.pareto_frontier
+            );
+        }
+        None => {
+            eprintln!("warning: no state.json in run directory — run did not checkpoint");
+        }
+    }
+
+    let final_path = storage.run_dir().join("final_results.json");
+    if final_path.exists() {
+        match std::fs::read_to_string(&final_path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        {
+            Some(blob) => {
+                println!("\nFinal results:");
+                println!("{}", serde_json::to_string_pretty(&blob).unwrap_or_default());
+            }
+            None => eprintln!("warning: could not parse final_results.json"),
+        }
+    } else {
+        println!("\n(No final_results.json — run may not have finished.)");
+    }
+
+    println!(
+        "\nResume is read-only in this phase. The reflection loop will \
+         pick up from this checkpoint once Phase 10 lands."
+    );
+    Ok(crate::ExitCode::Success)
 }
