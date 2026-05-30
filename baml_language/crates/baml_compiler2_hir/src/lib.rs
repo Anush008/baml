@@ -74,6 +74,7 @@ pub trait Db: baml_workspace::Db {
 /// `package_items`) intentionally ignore those legacy builtin files once the
 /// compiler2-owned builtin stdlib is present, so there is only one builtin
 /// source of truth in the compiler2 package graph.
+#[salsa::tracked]
 pub fn compiler2_all_files(db: &dyn Db) -> Vec<baml_base::SourceFile> {
     let mut files: Vec<baml_base::SourceFile> = db
         .project()
@@ -127,10 +128,14 @@ pub fn file_symbol_contributions(
     Arc::clone(&index.symbol_contributions)
 }
 
-/// Returns the item tree for a file (clones the Arc — O(1)).
+/// Returns the item tree for a file.
 ///
-/// Not tracked — the item tree is cached via `file_semantic_index`.
-/// This helper is for convenience in downstream queries.
+/// Salsa-tracked so it provides **early-cutoff** for its ~90 downstream readers:
+/// `file_semantic_index` is `no_eq` (re-runs on any edit to the file, including
+/// whitespace/comments), but `ItemTree: PartialEq`, so when the rebuilt tree is
+/// structurally unchanged this query backdates and dependents are not
+/// invalidated. Without this, every edit cascaded into all item-tree consumers.
+#[salsa::tracked]
 pub fn file_item_tree(db: &dyn Db, file: SourceFile) -> Arc<ItemTree> {
     let index = file_semantic_index(db, file);
     Arc::clone(&index.item_tree)

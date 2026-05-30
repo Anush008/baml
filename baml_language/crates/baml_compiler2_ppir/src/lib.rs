@@ -57,6 +57,12 @@ pub struct PpirExpansionItems<'db> {
 // -- Block attributes ---------------------------------------------------------
 
 /// Collect all @@ block attributes per type across all files.
+///
+/// Salsa-tracked and keyed on the project: previously this re-lowered every
+/// file (`ast::lower_file`) and was called once per file from
+/// `ppir_expansion_items`, making whole-build cost O(files²). Memoizing it
+/// computes the project-wide map once per revision instead.
+#[salsa::tracked(returns(ref))]
 pub fn collect_block_attrs(
     db: &dyn crate::Db,
     project: baml_workspace::Project,
@@ -88,10 +94,15 @@ pub fn collect_block_attrs(
 }
 
 /// Collect type alias bodies (qualified path → `PpirTy`) across all files.
+///
+/// Salsa-tracked, same rationale as [`collect_block_attrs`]. Returns an `Arc`
+/// because `PpirTy` does not implement `salsa::Update`; the `Arc` makes the
+/// per-call clone O(1) and the value cheap to share.
+#[salsa::tracked]
 pub fn collect_alias_bodies(
     db: &dyn crate::Db,
     project: baml_workspace::Project,
-) -> FxHashMap<Vec<Name>, PpirTy> {
+) -> Arc<FxHashMap<Vec<Name>, PpirTy>> {
     let mut result = FxHashMap::default();
     for file in project.files(db) {
         let pkg_info = baml_compiler2_hir::file_package::file_package(db, *file);
@@ -114,7 +125,7 @@ pub fn collect_alias_bodies(
             }
         }
     }
-    result
+    Arc::new(result)
 }
 
 // -- Helpers ------------------------------------------------------------------
@@ -160,10 +171,11 @@ pub fn ppir_expansion_items(db: &dyn Db, file: SourceFile) -> PpirExpansionItems
     // Build cross-package items map for resolving foreign type references
     let all_package_items = build_all_package_items(db);
 
-    // Get @@ block attributes and alias bodies
+    // Get @@ block attributes and alias bodies (memoized once per revision).
     let project = db.project();
-    let block_attrs = collect_block_attrs(db, project);
+    let block_attrs: &FxHashMap<Vec<Name>, Vec<Name>> = collect_block_attrs(db, project);
     let alias_bodies = collect_alias_bodies(db, project);
+    let alias_bodies: &FxHashMap<Vec<Name>, PpirTy> = &alias_bodies;
 
     let mut synthetic_items = Vec::new();
     let mut stream_return_types: Vec<(SmolStr, ast::TypeExpr)> = Vec::new();
@@ -210,8 +222,8 @@ pub fn ppir_expansion_items(db: &dyn Db, file: SourceFile) -> PpirExpansionItems
                         namespace_path: &pkg_info.namespace_path,
                         package_items,
                         all_package_items: &all_package_items,
-                        block_attrs: &block_attrs,
-                        alias_bodies: &alias_bodies,
+                        block_attrs,
+                        alias_bodies,
                     };
                     let (stream_type, sap_attrs) = stream_expand(&ppir_ty, &ctx);
 
@@ -297,8 +309,8 @@ pub fn ppir_expansion_items(db: &dyn Db, file: SourceFile) -> PpirExpansionItems
                     namespace_path: &pkg_info.namespace_path,
                     package_items,
                     all_package_items: &all_package_items,
-                    block_attrs: &block_attrs,
-                    alias_bodies: &alias_bodies,
+                    block_attrs,
+                    alias_bodies,
                 };
                 let expanded_body = expand_partial(&ty, &ctx);
 
@@ -351,8 +363,8 @@ pub fn ppir_expansion_items(db: &dyn Db, file: SourceFile) -> PpirExpansionItems
                     namespace_path: &pkg_info.namespace_path,
                     package_items,
                     all_package_items: &all_package_items,
-                    block_attrs: &block_attrs,
-                    alias_bodies: &alias_bodies,
+                    block_attrs,
+                    alias_bodies,
                 };
                 let (stream_type, _sap_attrs) = stream_expand(&ppir_ty, &ctx);
                 let stream_type_expr = stream_type.to_type_expr();
@@ -511,6 +523,13 @@ pub fn file_symbol_contributions(
 }
 
 /// Canonical item tree (original + *$stream types).
+///
+/// Salsa-tracked for early-cutoff (same rationale as the HIR `file_item_tree`):
+/// the underlying `file_semantic_index` is `no_eq`, but `ItemTree: PartialEq`,
+/// so an edit that doesn't change the (canonical) item tree backdates here and
+/// its readers — emit's per-file globals/classes/enums passes — are not
+/// invalidated.
+#[salsa::tracked]
 pub fn file_item_tree(db: &dyn Db, file: SourceFile) -> Arc<ItemTree> {
     let index = file_semantic_index(db, file);
     Arc::clone(&index.item_tree)

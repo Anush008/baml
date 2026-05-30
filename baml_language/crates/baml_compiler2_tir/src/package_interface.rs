@@ -284,15 +284,36 @@ fn lower_class_method_signature<'db>(
 
 // ── package_interface Salsa query ──────────────────────────────────────────
 
+/// A single namespace's exported types and functions — the per-namespace slice
+/// of a [`PackageInterface`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamespaceInterface {
+    pub types: FxHashMap<Name, ExportedType>,
+    pub functions: FxHashMap<Name, ExportedFunction>,
+}
+
+/// Build one namespace's interface (L8: finer granularity).
+///
+/// Split out of `package_interface` and keyed on `(pkg_id, ns_path)` so that
+/// editing an item in one namespace re-lowers only that namespace's types and
+/// functions; sibling namespaces cut off here via `PartialEq`, instead of the
+/// whole package interface re-lowering on any package edit.
 #[salsa::tracked(returns(ref))]
-pub fn package_interface<'db>(db: &'db dyn crate::Db, pkg_id: PackageId<'db>) -> PackageInterface {
+pub fn namespace_interface<'db>(
+    db: &'db dyn crate::Db,
+    pkg_id: PackageId<'db>,
+    ns_path: Vec<Name>,
+) -> NamespaceInterface {
     let pkg_items = baml_compiler2_ppir::package_items(db, pkg_id);
 
-    let mut types: FxHashMap<Vec<Name>, FxHashMap<Name, ExportedType>> = FxHashMap::default();
-    let mut functions: FxHashMap<Vec<Name>, FxHashMap<Name, ExportedFunction>> =
-        FxHashMap::default();
+    let mut types: FxHashMap<Name, ExportedType> = FxHashMap::default();
+    let mut functions: FxHashMap<Name, ExportedFunction> = FxHashMap::default();
 
-    for (ns_path, ns_items) in &pkg_items.namespaces {
+    let ns_items = match pkg_items.namespaces.get(&ns_path) {
+        Some(ns) => ns,
+        None => return NamespaceInterface { types, functions },
+    };
+    {
         // Export types
         for (name, def) in &ns_items.types {
             let exported = match def {
@@ -386,10 +407,7 @@ pub fn package_interface<'db>(db: &'db dyn crate::Db, pkg_id: PackageId<'db>) ->
                 }
                 _ => continue,
             };
-            types
-                .entry(ns_path.clone())
-                .or_default()
-                .insert(name.clone(), exported);
+            types.insert(name.clone(), exported);
         }
 
         // Export free functions
@@ -458,7 +476,7 @@ pub fn package_interface<'db>(db: &'db dyn crate::Db, pkg_id: PackageId<'db>) ->
                 _ => None,
             };
 
-            functions.entry(ns_path.clone()).or_default().insert(
+            functions.insert(
                 name.clone(),
                 ExportedFunction {
                     name: name.clone(),
@@ -473,7 +491,29 @@ pub fn package_interface<'db>(db: &'db dyn crate::Db, pkg_id: PackageId<'db>) ->
         }
     }
 
-    // Compute throw sets for this package
+    NamespaceInterface { types, functions }
+}
+
+#[salsa::tracked(returns(ref))]
+pub fn package_interface<'db>(db: &'db dyn crate::Db, pkg_id: PackageId<'db>) -> PackageInterface {
+    let pkg_items = baml_compiler2_ppir::package_items(db, pkg_id);
+
+    let mut types: FxHashMap<Vec<Name>, FxHashMap<Name, ExportedType>> = FxHashMap::default();
+    let mut functions: FxHashMap<Vec<Name>, FxHashMap<Name, ExportedFunction>> =
+        FxHashMap::default();
+
+    // Compose per-namespace interfaces (each memoized + cut-off independently).
+    for ns_path in pkg_items.namespaces.keys() {
+        let ns_iface = namespace_interface(db, pkg_id, ns_path.clone());
+        if !ns_iface.types.is_empty() {
+            types.insert(ns_path.clone(), ns_iface.types.clone());
+        }
+        if !ns_iface.functions.is_empty() {
+            functions.insert(ns_path.clone(), ns_iface.functions.clone());
+        }
+    }
+
+    // Throw sets remain package-wide (cross-function transitive fixpoint).
     let throw_sets = function_throw_sets(db, pkg_id);
 
     PackageInterface {

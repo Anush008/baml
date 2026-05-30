@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use baml_base::{Name, TypePath};
-use la_arena::{Arena, Idx};
+use la_arena::{Arena, Idx, RawIdx};
 use text_size::TextRange;
 
 // ── Attributes ──────────────────────────────────────────────────
@@ -513,27 +513,31 @@ impl AstSourceMap {
         }
     }
 
+    /// O(1) span lookup into a `TextRange` arena that is index-parallel to the
+    /// source-element arena. The `RawIdx` is shared across the parallel arenas
+    /// (same index, different element type), so we rebuild an `Idx<TextRange>`
+    /// from it and index directly instead of an O(n) `.iter().nth(raw)` scan.
+    /// Bounds-checked because callers may pass ids from a different arena.
+    #[inline]
+    fn span_at(arena: &Arena<TextRange>, raw: RawIdx) -> TextRange {
+        if (raw.into_u32() as usize) < arena.len() {
+            arena[Idx::from_raw(raw)]
+        } else {
+            TextRange::default()
+        }
+    }
+
     /// Look up the source span of a statement by its `StmtId`.
     ///
     /// The `stmt_spans` arena is parallel to `ExprBody::stmts` — same indices,
     /// different element type. We convert via raw index.
     pub fn stmt_span(&self, id: StmtId) -> TextRange {
-        let raw: u32 = id.into_raw().into_u32();
-        self.stmt_spans
-            .iter()
-            .nth(raw as usize)
-            .map(|(_, &span)| span)
-            .unwrap_or_default()
+        Self::span_at(&self.stmt_spans, id.into_raw())
     }
 
     /// Look up the source span of an expression by its `ExprId`.
     pub fn expr_span(&self, id: ExprId) -> TextRange {
-        let raw: u32 = id.into_raw().into_u32();
-        self.expr_spans
-            .iter()
-            .nth(raw as usize)
-            .map(|(_, &span)| span)
-            .unwrap_or_default()
+        Self::span_at(&self.expr_spans, id.into_raw())
     }
 
     /// Look up the member-name span for a `MemberAccess` expression.
@@ -565,42 +569,22 @@ impl AstSourceMap {
 
     /// Look up the source span of a pattern by its `PatId`.
     pub fn pattern_span(&self, id: PatId) -> TextRange {
-        let raw: u32 = id.into_raw().into_u32();
-        self.pattern_spans
-            .iter()
-            .nth(raw as usize)
-            .map(|(_, &span)| span)
-            .unwrap_or_default()
+        Self::span_at(&self.pattern_spans, id.into_raw())
     }
 
     /// Look up the source span of a match arm by its `MatchArmId`.
     pub fn match_arm_span(&self, id: MatchArmId) -> TextRange {
-        let raw: u32 = id.into_raw().into_u32();
-        self.match_arm_spans
-            .iter()
-            .nth(raw as usize)
-            .map(|(_, &span)| span)
-            .unwrap_or_default()
+        Self::span_at(&self.match_arm_spans, id.into_raw())
     }
 
     /// Look up the source span of a type annotation by its `TypeAnnotId`.
     pub fn type_annotation_span(&self, id: TypeAnnotId) -> TextRange {
-        let raw: u32 = id.into_raw().into_u32();
-        self.type_annotation_spans
-            .iter()
-            .nth(raw as usize)
-            .map(|(_, &span)| span)
-            .unwrap_or_default()
+        Self::span_at(&self.type_annotation_spans, id.into_raw())
     }
 
     /// Look up the source span of a catch arm by its `CatchArmId`.
     pub fn catch_arm_span(&self, id: CatchArmId) -> TextRange {
-        let raw: u32 = id.into_raw().into_u32();
-        self.catch_arm_spans
-            .iter()
-            .nth(raw as usize)
-            .map(|(_, &span)| span)
-            .unwrap_or_default()
+        Self::span_at(&self.catch_arm_spans, id.into_raw())
     }
 }
 

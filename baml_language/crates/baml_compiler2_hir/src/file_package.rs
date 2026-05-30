@@ -7,7 +7,7 @@
 use baml_base::{Name, SourceFile};
 
 /// Package/namespace info for a file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]
 pub struct PackageInfo {
     /// Package name: "user", "baml", or "env".
     pub package: Name,
@@ -31,6 +31,11 @@ fn extract_ns_name(component: &str) -> Option<Name> {
 }
 
 /// Determine which package a file belongs to based on its path.
+///
+/// Salsa-tracked: this is a pure function of `file.path(db)` and is called
+/// per-file in many whole-project loops (emit passes, diagnostics, MIR). Caching
+/// memoizes the path-string parsing and namespace extraction per file.
+#[salsa::tracked]
 pub fn file_package(db: &dyn crate::Db, file: SourceFile) -> PackageInfo {
     let path = file.path(db);
     let path_str = path.to_string_lossy();

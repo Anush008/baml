@@ -557,6 +557,53 @@ fn infer_scope_types_cycle_initial<'db>(
     }
 }
 
+/// Per-package subtype alias map (own + dependency type aliases), memoized.
+///
+/// `infer_scope_types` previously rebuilt this map on every scope (~12k times
+/// per build) via `collect_type_aliases` + the dependency loop. Computing it
+/// once per package and cloning the (much cheaper) result per scope removes that
+/// quadratic-feeling per-scope rebuild from type checking.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackageSubtypeAliases(pub HashMap<crate::ty::QualifiedTypeName, crate::ty::Ty>);
+
+#[allow(unsafe_code)]
+unsafe impl salsa::Update for PackageSubtypeAliases {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        let old_ref = unsafe { &*old_pointer };
+        if *old_ref == new_value {
+            false
+        } else {
+            unsafe {
+                std::ptr::drop_in_place(old_pointer);
+                std::ptr::write(old_pointer, new_value);
+            }
+            true
+        }
+    }
+}
+
+#[salsa::tracked(returns(ref))]
+pub fn package_subtype_aliases<'db>(
+    db: &'db dyn crate::Db,
+    pkg_id: PackageId<'db>,
+) -> PackageSubtypeAliases {
+    let res_ctx = crate::package_interface::package_resolution_context(db, pkg_id);
+    let pkg_items = &res_ctx.own_items;
+    let mut aliases = collect_type_aliases(db, pkg_items);
+    for (_dep_name, dep_iface) in &res_ctx.dep_interfaces {
+        for types_in_ns in dep_iface.types.values() {
+            for exported in types_in_ns.values() {
+                if let crate::package_interface::ExportedType::TypeAlias { qtn, resolved } =
+                    exported
+                {
+                    aliases.insert(qtn.clone(), resolved.clone());
+                }
+            }
+        }
+    }
+    PackageSubtypeAliases(aliases)
+}
+
 #[salsa::tracked(returns(ref), cycle_initial=infer_scope_types_cycle_initial)]
 pub fn infer_scope_types<'db>(
     db: &'db dyn crate::Db,
@@ -573,20 +620,9 @@ pub fn infer_scope_types<'db>(
     let res_ctx = crate::package_interface::package_resolution_context(db, pkg_id);
     let pkg_items = &res_ctx.own_items;
 
-    let mut aliases = collect_type_aliases(db, pkg_items);
-    // Also collect type aliases from dependency packages so that e.g.
-    // `testing.TestRunner` can be resolved during subtype checking.
-    for (_dep_name, dep_iface) in &res_ctx.dep_interfaces {
-        for types_in_ns in dep_iface.types.values() {
-            for exported in types_in_ns.values() {
-                if let crate::package_interface::ExportedType::TypeAlias { qtn, resolved } =
-                    exported
-                {
-                    aliases.insert(qtn.clone(), resolved.clone());
-                }
-            }
-        }
-    }
+    // Own + dependency type aliases, built once per package (see
+    // `package_subtype_aliases`) instead of rebuilt on every scope.
+    let aliases = package_subtype_aliases(db, pkg_id).0.clone();
     let context = InferContext::new(db, scope_id);
     let mut builder = TypeInferenceBuilder::new(context, res_ctx, pkg_id, scope_id, aliases);
 
