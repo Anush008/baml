@@ -29,7 +29,7 @@ fn constant_fold_int_addition() {
             2 + 3
         }
     "#;
-    insta::assert_snapshot!(unoptimized(source), @"
+    insta::assert_snapshot!(unoptimized(source), @r"
     function main() -> int {
         load_const 2
         load_const 3
@@ -52,7 +52,7 @@ fn constant_fold_int_arithmetic_chain() {
             (10 * 3) + (100 - 50) - 1
         }
     "#;
-    insta::assert_snapshot!(unoptimized(source), @"
+    insta::assert_snapshot!(unoptimized(source), @r"
     function main() -> int {
         load_const 10
         load_const 3
@@ -154,7 +154,7 @@ fn constant_fold_mixed_not_foldable() {
             x + 1
         }
     "#;
-    insta::assert_snapshot!(unoptimized(source), @"
+    insta::assert_snapshot!(unoptimized(source), @r"
     function main(x: int) -> int {
         load_var x
         load_const 1
@@ -162,7 +162,7 @@ fn constant_fold_mixed_not_foldable() {
         return
     }
     ");
-    insta::assert_snapshot!(optimized(source), @"
+    insta::assert_snapshot!(optimized(source), @r"
     function main(x: int) -> int {
         load_var x
         load_const 1

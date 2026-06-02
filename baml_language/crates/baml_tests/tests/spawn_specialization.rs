@@ -23,7 +23,7 @@ async fn non_spawn_captured_int_arithmetic_keeps_specialized_op() {
         "#
     );
 
-    insta::assert_snapshot!(output.bytecode, @r#"
+    insta::assert_snapshot!(output.bytecode, @r"
     function main() -> int {
         load_var ?1
         make_cell
@@ -39,7 +39,7 @@ async fn non_spawn_captured_int_arithmetic_keeps_specialized_op() {
         add_int
         return
     }
-    "#);
+    ");
     assert_eq!(output.result, Ok(BexExternalValue::Int(2)));
 }
 

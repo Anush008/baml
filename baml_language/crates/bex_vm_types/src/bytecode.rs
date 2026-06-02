@@ -719,6 +719,17 @@ pub enum Instruction {
     /// can emit a `CustomEvent` with full span context. Execution resumes
     /// after the engine processes the event.
     SendEvent,
+
+    // ── Operand-movement superinstructions (CPython-style) ────────────────
+    // Combine two adjacent local-movement ops into one dispatch. Pure
+    // replace-in-place at emit time (like `StoreVarLoadVar`), confined to the
+    // current basic block, so jump targets and block addresses are unaffected.
+    /// Fused `LoadVar(a); LoadVar(b)` — push `local[a]`, then `local[b]`.
+    /// (`CPython` `LOAD_FAST_LOAD_FAST`.)
+    LoadVar2(usize, usize),
+    /// Fused `StoreVar(a); StoreVar(b)` — pop into `local[a]`, then `local[b]`.
+    /// (`CPython` `STORE_FAST_STORE_FAST`.)
+    StoreVar2(usize, usize),
 }
 
 /// Compact bytecode opcodes.
@@ -861,6 +872,10 @@ pub enum OpCode {
     // ── Two operands (9 bytes) ─────────────────────────────────
     JumpTable,   // u32 table_idx + i32 default_offset
     MakeClosure, // u32 object_idx (capture_count is popped from the stack)
+
+    // ── Operand-movement superinstructions: two u32 operands (9 bytes) ──
+    LoadVar2,
+    StoreVar2,
 }
 
 impl OpCode {
@@ -988,6 +1003,9 @@ impl OpCode {
 
             // 9-byte: opcode + u32 + i32
             Self::JumpTable => 9,
+
+            // 9-byte: opcode + u32 + u32 (operand-movement superinstructions)
+            Self::LoadVar2 | Self::StoreVar2 => 9,
         }
     }
 }
@@ -1108,6 +1126,8 @@ impl TryFrom<u8> for OpCode {
             x if x == Self::JumpIfFalse as u8 => Ok(Self::JumpIfFalse),
             x if x == Self::JumpTable as u8 => Ok(Self::JumpTable),
             x if x == Self::MakeClosure as u8 => Ok(Self::MakeClosure),
+            x if x == Self::LoadVar2 as u8 => Ok(Self::LoadVar2),
+            x if x == Self::StoreVar2 as u8 => Ok(Self::StoreVar2),
             _ => Err(byte),
         }
     }
@@ -1227,6 +1247,8 @@ impl std::fmt::Display for OpCode {
             Self::JumpIfFalse => "JUMP_IF_FALSE",
             Self::JumpTable => "JUMP_TABLE",
             Self::MakeClosure => "MAKE_CLOSURE",
+            Self::LoadVar2 => "LOAD_VAR2",
+            Self::StoreVar2 => "STORE_VAR2",
         };
         f.write_str(name)
     }
@@ -1355,6 +1377,8 @@ impl std::fmt::Display for Instruction {
             Instruction::BinOp(op) => write!(f, "BIN_OP {op}"),
             Instruction::CmpOp(op) => write!(f, "CMP_OP {op}"),
             Instruction::AddInt => f.write_str("ADD_INT"),
+            Instruction::LoadVar2(a, b) => write!(f, "LOAD_VAR2 {a} {b}"),
+            Instruction::StoreVar2(a, b) => write!(f, "STORE_VAR2 {a} {b}"),
             Instruction::SubInt => f.write_str("SUB_INT"),
             Instruction::MulInt => f.write_str("MUL_INT"),
             Instruction::DivInt => f.write_str("DIV_INT"),
@@ -1888,6 +1912,16 @@ impl Bytecode {
                     );
                 }
 
+                // ── Two usize operands → u32 + u32 (movement superinstructions) ──
+                Instruction::LoadVar2(a, b) | Instruction::StoreVar2(a, b) => {
+                    code.extend_from_slice(
+                        &u32::try_from(*a).expect("operand fits u32").to_le_bytes(),
+                    );
+                    code.extend_from_slice(
+                        &u32::try_from(*b).expect("operand fits u32").to_le_bytes(),
+                    );
+                }
+
                 // ── GlobalIndex operand → u32 ───────────────────────
                 Instruction::LoadGlobal(g)
                 | Instruction::StoreGlobal(g)
@@ -2163,6 +2197,10 @@ impl Bytecode {
             Instruction::LoadCapture(_) => OpCode::LoadCapture,
             Instruction::StoreCapture(_) => OpCode::StoreCapture,
             Instruction::CaptureRef(_) => OpCode::CaptureRef,
+
+            // Operand-movement superinstructions
+            Instruction::LoadVar2(..) => OpCode::LoadVar2,
+            Instruction::StoreVar2(..) => OpCode::StoreVar2,
 
             // Specialized arithmetic (dedicated opcodes, skip type dispatch)
             Instruction::AddInt => OpCode::AddInt,

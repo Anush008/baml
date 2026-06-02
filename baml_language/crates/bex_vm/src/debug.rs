@@ -210,6 +210,8 @@ pub(crate) fn display_instruction(
         | Instruction::CmpIntOp(_)
         | Instruction::CmpFloatOp(_)
         | Instruction::CmpBigintOp(_)
+        | Instruction::LoadVar2(..)
+        | Instruction::StoreVar2(..)
         | Instruction::UnaryOp(_)
         | Instruction::AllocArray(_)
         | Instruction::AllocMap(_)
@@ -341,12 +343,14 @@ fn instruction_style(instruction: &Instruction) -> Style {
     match instruction {
         Instruction::LoadConst(_)
         | Instruction::LoadVar(_)
+        | Instruction::LoadVar2(..)
         | Instruction::LoadGlobal(_)
         | Instruction::LoadField(_)
         | Instruction::LoadArrayElement
         | Instruction::LoadMapElement => Style::new().blue(),
         Instruction::StoreVar(_)
         | Instruction::StoreVarLoadVar(_)
+        | Instruction::StoreVar2(..)
         | Instruction::StoreGlobal(_)
         | Instruction::StoreField(_)
         | Instruction::InitField(_)
@@ -703,6 +707,8 @@ fn display_instruction_textual(
         Instruction::LoadVar(idx) => format!("load_var {}", meta_str(idx)),
         Instruction::StoreVar(idx) => format!("store_var {}", meta_str(idx)),
         Instruction::StoreVarLoadVar(idx) => format!("store_var_load_var {}", meta_str(idx)),
+        Instruction::LoadVar2(a, b) => format!("load_var2 {a} {b}"),
+        Instruction::StoreVar2(a, b) => format!("store_var2 {a} {b}"),
 
         // --- Globals ---
         Instruction::LoadGlobal(idx) => format!("load_global {}", meta_str(&idx.raw())),
@@ -1323,6 +1329,13 @@ pub fn display_compact_bytecode(
                     f,
                     "obj={obj_idx}  captures={capture_count}  ntypeargs={ntypeargs}"
                 )?;
+            }
+
+            // Two u32 operands (operand-movement superinstructions)
+            OpCode::LoadVar2 | OpCode::StoreVar2 => {
+                let a = read_u32(code, &mut pc);
+                let b = read_u32(code, &mut pc);
+                writeln!(f, "{a} {b}")?;
             }
         }
     }
