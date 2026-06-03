@@ -2022,6 +2022,7 @@ impl Bytecode {
                             .to_le_bytes(),
                     );
                 }
+
             }
         }
 
@@ -2129,6 +2130,8 @@ impl Bytecode {
             Instruction::MakeCell => OpCode::MakeCell,
             Instruction::SendEvent => OpCode::SendEvent,
             Instruction::ContainerLen => OpCode::ContainerLen,
+            Instruction::LoadVar2(..) => OpCode::LoadVar2,
+            Instruction::StoreVar2(..) => OpCode::StoreVar2,
 
             // Expanded sub-enum variants
             Instruction::BinOp(op) => match op {
@@ -2197,10 +2200,6 @@ impl Bytecode {
             Instruction::LoadCapture(_) => OpCode::LoadCapture,
             Instruction::StoreCapture(_) => OpCode::StoreCapture,
             Instruction::CaptureRef(_) => OpCode::CaptureRef,
-
-            // Operand-movement superinstructions
-            Instruction::LoadVar2(..) => OpCode::LoadVar2,
-            Instruction::StoreVar2(..) => OpCode::StoreVar2,
 
             // Specialized arithmetic (dedicated opcodes, skip type dispatch)
             Instruction::AddInt => OpCode::AddInt,

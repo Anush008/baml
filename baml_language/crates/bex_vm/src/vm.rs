@@ -2005,6 +2005,15 @@ impl BexVm {
             .into());
         }
 
+        // Persist the caller's live PC before pushing the interrupt frame.
+        // Once this frame is no longer innermost, unwinding/stack-trace lookups
+        // read its `faulting_pc` (no longer updated per-op under lazy `cur_pc`),
+        // so it must capture the instruction we interrupted. Mirrors
+        // `execute_call_from_locals_offset`.
+        if let Some(Frame::Bytecode(bf)) = self.frames.last_mut() {
+            bf.faulting_pc = self.cur_pc;
+        }
+
         // Index of the frame that starts the interrupt code.
         self.interrupt_frame = Some(self.frames.len());
 
@@ -2152,6 +2161,28 @@ impl BexVm {
         }
 
         Ok(None)
+    }
+
+    /// Combine the two `store_local_value` yields from a fused `StoreVar2` when
+    /// at least one watched local notified. `store_local_value` only ever yields
+    /// `Notify(Variables(..))`, so when both locals notify their node lists are
+    /// concatenated into one yield — no watch event is dropped. Cold: reached
+    /// only on the watched-local path, never in normal execution.
+    #[cold]
+    #[inline(never)]
+    fn merge_store_yields(y1: Option<VmExecState>, y2: Option<VmExecState>) -> VmExecState {
+        match (y1, y2) {
+            (
+                Some(VmExecState::Notify(WatchNotification::Variables(mut n1))),
+                Some(VmExecState::Notify(WatchNotification::Variables(n2))),
+            ) => {
+                n1.extend(n2);
+                VmExecState::Notify(WatchNotification::Variables(n1))
+            }
+            // Exactly one notified (or a defensive non-`Variables` variant).
+            (Some(state), _) | (_, Some(state)) => state,
+            (None, None) => unreachable!("merge_store_yields called with both None"),
+        }
     }
 
     pub fn error_to_exception_value(&mut self, error: VmBamlError) -> Value {
@@ -2624,24 +2655,15 @@ impl BexVm {
             bf.faulting_pc = call_site;
         }
 
-        // A host closure isn't a Function/Closure/BoundMethod and dispatches via
-        // a single-yield sys-op rather than a pushed frame. This path is reached
-        // when a host callable is invoked *indirectly* — e.g. handed to a native
-        // higher-order builtin like `array.map(f)`, whose `YieldToCall` funnels
-        // its callback through here (a direct `f(x)` is handled inline by the
-        // `CallIndirect` opcodes). The call args are already on the stack at
-        // `locals_offset`; drain them and yield. The Native continuation frame
-        // the caller pushed resumes — with the host result on the stack — once
-        // the engine completes the op, exactly as for a bytecode callback's
-        // return value.
-        // Classify the callee with a single heap deref. A plain `Function` —
-        // the overwhelmingly common case, including all recursion — needs
-        // neither closure captures nor bound-method class args, so it takes the
-        // empty fast path. `closure_type_args` are the Closure's captured type
-        // args; `bound_method_class_type_args` are the receiver's class type
-        // args (De Bruijn ordering: class args ++ explicit call-site args,
-        // matching enclosing_generic_params() which puts class params first).
-        // Both are injected into the new BytecodeFrame after it is created.
+        // Classify the callee with a single heap deref, extracting everything
+        // the slow paths need. A plain `Function` — the overwhelmingly common
+        // case, including all recursion — needs neither closure captures nor
+        // bound-method class args, so it takes the empty fast path. The
+        // `closure_type_args` are a Closure's captured type args; the
+        // `bound_method_class_type_args` are the receiver's class type args (De
+        // Bruijn ordering: class args ++ explicit call-site args, matching
+        // enclosing_generic_params() which puts class params first). Both are
+        // injected into the new BytecodeFrame after it is created.
         let (is_host, closure_type_args, bound_method_class_type_args): (
             bool,
             Box<[baml_type::Ty]>,
@@ -2664,8 +2686,15 @@ impl BexVm {
         };
 
         // A host closure isn't a Function/Closure/BoundMethod and dispatches via
-        // a single-yield sys-op rather than a pushed frame (reached when a host
-        // callable is invoked indirectly, e.g. through `array.map(f)`).
+        // a single-yield sys-op rather than a pushed frame. This path is reached
+        // when a host callable is invoked *indirectly* — e.g. handed to a native
+        // higher-order builtin like `array.map(f)`, whose `YieldToCall` funnels
+        // its callback through here (a direct `f(x)` is handled inline by the
+        // `CallIndirect` opcodes). The call args are already on the stack at
+        // `locals_offset`; drain them and yield. The Native continuation frame
+        // the caller pushed resumes — with the host result on the stack — once
+        // the engine completes the op, exactly as for a bytecode callback's
+        // return value.
         if is_host {
             let user_args: Vec<Value> = self.stack.drain(locals_offset..).collect();
             return Ok(Some(self.host_closure_call_sysop(callee_ptr, user_args)));
@@ -3246,7 +3275,7 @@ impl BexVm {
         let (kp_start, ops_start) = if kp {
             (crate::kperf::exec_start(), self.op_count)
         } else {
-            ((0, 0), 0)
+            (None, 0)
         };
 
         let result = match self.exec_inner() {
@@ -3867,19 +3896,6 @@ impl BexVm {
                     }
                 }
 
-                OpCode::StoreVarLoadVar => {
-                    let slot = { read_u32_unchecked(code, pc) as usize };
-                    let Frame::Bytecode(bf) = &self.frames[*frame_idx] else {
-                        unreachable!()
-                    };
-                    let local_var_index = Self::local_slot_stack_index(bf.locals_offset, slot);
-                    let value_slot = self.stack.ensure_slot_from_top(0);
-                    let value = self.stack[value_slot];
-                    if let Some(state) = self.store_local_value(local_var_index, value)? {
-                        return Ok(Some(state));
-                    }
-                }
-
                 // ── Operand-movement superinstructions (CPython-style) ────────
                 // LoadVar2(a, b) == `LoadVar(a); LoadVar(b)`: push both locals.
                 OpCode::LoadVar2 => {
@@ -3897,10 +3913,14 @@ impl BexVm {
                     self.stack.push(vb);
                 }
                 // StoreVar2(a, b) == `StoreVar(a); StoreVar(b)`: pop TOS into
-                // local[a], then pop into local[b]. Both stores complete before
-                // returning; in the rare case where both are watched locals and
-                // both produce notifications, only the first is surfaced (watch
-                // granularity, not store correctness).
+                // local[a], then pop into local[b]. Both stores always complete
+                // before returning — a single fused op can't yield mid-way and
+                // resume into the second store (the saved PC is already past the
+                // whole instruction), so each `store_local_value` must run. When
+                // both are watched locals and both notify, the two node lists are
+                // merged into one yield rather than dropping the second, so no
+                // watch event is lost (equivalent to two sequential StoreVar
+                // notifications, coalesced into a single batch).
                 OpCode::StoreVar2 => {
                     let a = { read_u32_unchecked(code, pc) as usize };
                     let b = { read_u32_unchecked(code, pc) as usize };
@@ -3916,7 +3936,24 @@ impl BexVm {
                     let vb = self.stack.ensure_pop();
                     let y1 = self.store_local_value(sa, va)?;
                     let y2 = self.store_local_value(sb, vb)?;
-                    if let Some(state) = y1.or(y2) {
+                    // Hot path: no watched locals, both stores returned `None` —
+                    // fall through. The merge (only reached when a watched local
+                    // notifies) is outlined into a cold helper so this arm stays
+                    // a single predicted branch.
+                    if unlikely(y1.is_some() || y2.is_some()) {
+                        return Ok(Some(Self::merge_store_yields(y1, y2)));
+                    }
+                }
+
+                OpCode::StoreVarLoadVar => {
+                    let slot = { read_u32_unchecked(code, pc) as usize };
+                    let Frame::Bytecode(bf) = &self.frames[*frame_idx] else {
+                        unreachable!()
+                    };
+                    let local_var_index = Self::local_slot_stack_index(bf.locals_offset, slot);
+                    let value_slot = self.stack.ensure_slot_from_top(0);
+                    let value = self.stack[value_slot];
+                    if let Some(state) = self.store_local_value(local_var_index, value)? {
                         return Ok(Some(state));
                     }
                 }
@@ -5623,10 +5660,12 @@ impl BexVm {
                     let data = self.stack.ensure_pop();
                     let name_value = self.stack.ensure_pop();
                     let event_name = self.as_string(&name_value)?.to_string();
+                    // This is the innermost executing frame, so its live PC is
+                    // `cur_pc` (the frame's `faulting_pc` is no longer updated
+                    // per-op; it only holds outer frames' call-site PCs).
+                    let cur_pc = self.cur_pc;
                     let source_location = if let Frame::Bytecode(bf) = &self.frames[*frame_idx] {
-                        // Innermost frame's live PC is `cur_pc` (frame.faulting_pc
-                        // is only refreshed at call/throw time now).
-                        let pc = self.cur_pc;
+                        let pc = cur_pc;
                         let func_obj = self.get_object(bf.function).as_callable().ok();
                         func_obj
                             .and_then(|func| {
