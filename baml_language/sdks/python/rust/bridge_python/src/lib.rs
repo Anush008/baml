@@ -22,7 +22,7 @@ use pyo3_stub_gen::{define_stub_info_gatherer, derive::gen_stub_pyfunction};
 #[gen_stub_pyfunction]
 #[pyfunction]
 fn get_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    baml_version::CANONICAL_VERSION
 }
 
 /// No-op: tracing has been removed. Kept as a live symbol for ABI stability

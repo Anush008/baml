@@ -22,6 +22,31 @@ use crate::{
 };
 
 pub type TypeBindings = FxHashMap<Name, Ty>;
+pub type AssociatedBindings = Vec<(Name, Ty)>;
+pub type InterfaceClosureEntry<'db> = (
+    baml_compiler2_hir::loc::InterfaceLoc<'db>,
+    Vec<Ty>,
+    AssociatedBindings,
+);
+type InterfaceClosureQueueEntry<'db> = (
+    baml_compiler2_hir::loc::InterfaceLoc<'db>,
+    Vec<Ty>,
+    AssociatedBindings,
+    FxHashSet<baml_compiler2_hir::loc::InterfaceLoc<'db>>,
+);
+
+#[derive(Clone, Copy)]
+struct InterfaceTypeAssocLowering<'a, 'db> {
+    db: &'db dyn crate::Db,
+    iface: &'a baml_compiler2_hir::item_tree::Interface,
+    interface_args: &'a [Ty],
+    explicit_associated_bindings: &'a [baml_compiler2_ast::AssociatedTypeBinding],
+    iface_pkg_items: &'a baml_compiler2_hir::package::PackageItems<'db>,
+    binding_pkg_items: &'a baml_compiler2_hir::package::PackageItems<'db>,
+    iface_namespace_path: &'a [Name],
+    binding_namespace_path: &'a [Name],
+    outer_bindings: &'a TypeBindings,
+}
 
 /// Where an interface implementation rule came from.
 ///
@@ -190,12 +215,10 @@ impl ImplementsRegistry {
     }
 
     pub fn type_implements(&self, ty: &Ty, iface_qtn: &QualifiedTypeName) -> bool {
-        match ty {
-            Ty::Class(class_qtn, _, _) => self.implements(class_qtn, iface_qtn),
-            _ => implementation_key_for_ty(ty)
-                .and_then(|key| self.type_implements.get(&key))
-                .is_some_and(|set| set.contains(iface_qtn)),
-        }
+        let aliases = std::collections::HashMap::default();
+        self.type_implements_qtn_via_rule(ty, iface_qtn, &aliases, |actual, bound| {
+            self.compatibility_subtype(actual, bound)
+        })
     }
 
     /// True iff interface `sub` requires interface `sup` (transitively).
@@ -204,6 +227,69 @@ impl ImplementsRegistry {
         self.interface_requires
             .get(sub)
             .is_some_and(|set| set.contains(sup))
+    }
+
+    fn type_implements_qtn_via_rule(
+        &self,
+        actual_ty: &Ty,
+        iface_qtn: &QualifiedTypeName,
+        aliases: &std::collections::HashMap<QualifiedTypeName, Ty>,
+        mut is_subtype: impl FnMut(&Ty, &Ty) -> bool,
+    ) -> bool {
+        self.interface_impl_rule_index
+            .by_interface
+            .get(iface_qtn)
+            .is_some_and(|indices| {
+                indices.iter().any(|idx| {
+                    let Some(rule) = self.interface_impl_rules.get(*idx) else {
+                        return false;
+                    };
+                    let mut bindings = TypeBindings::default();
+                    match_ty_pattern_into(
+                        &rule.for_ty_pattern,
+                        actual_ty,
+                        &rule.generic_params,
+                        aliases,
+                        &mut bindings,
+                    )
+                    .is_some()
+                        && validate_rule_bounds(rule, &bindings, &mut is_subtype, true).is_some()
+                })
+            })
+    }
+
+    fn compatibility_subtype(&self, actual: &Ty, bound: &Ty) -> bool {
+        if actual == bound {
+            return true;
+        }
+
+        if let Ty::Union(members, _) = actual
+            && !members.is_empty()
+        {
+            return members
+                .iter()
+                .all(|member| self.compatibility_subtype(member, bound));
+        }
+
+        if let Ty::Interface(iface_qtn, iface_args, associated_bindings, _) = bound
+            && !matches!(actual, Ty::Interface(..))
+        {
+            let aliases = std::collections::HashMap::default();
+            let requested_iface_ty = Ty::Interface(
+                iface_qtn.clone(),
+                iface_args.clone(),
+                associated_bindings.clone(),
+                TyAttr::default(),
+            );
+            return self.type_implements_interface_via_rule(
+                actual,
+                &requested_iface_ty,
+                &aliases,
+                |inner_actual, inner_bound| self.compatibility_subtype(inner_actual, inner_bound),
+            );
+        }
+
+        normalize::is_subtype_of(actual, bound, &std::collections::HashMap::default())
     }
 
     /// True iff `class_qtn<class_type_args>` nominally implements `iface_qtn`
@@ -474,7 +560,7 @@ fn derive_compatibility_views(
     }
 
     for rule in rules {
-        let Ty::Interface(iface_qtn, interface_type_args, _) = &rule.interface_ty else {
+        let Ty::Interface(iface_qtn, interface_type_args, _, _) = &rule.interface_ty else {
             continue;
         };
 
@@ -493,16 +579,18 @@ fn derive_compatibility_views(
                 });
             }
             Ty::Class(class_qtn, _, _) => {
-                views
-                    .class_implements
-                    .entry(class_qtn.clone())
-                    .or_default()
-                    .insert(iface_qtn.clone());
-                if !interface_type_args.is_empty() {
-                    views.implements_type_args.insert(
-                        (class_qtn.clone(), iface_qtn.clone()),
-                        interface_type_args.clone(),
-                    );
+                if rule.generic_param_bounds.iter().all(Option::is_none) {
+                    views
+                        .class_implements
+                        .entry(class_qtn.clone())
+                        .or_default()
+                        .insert(iface_qtn.clone());
+                    if !interface_type_args.is_empty() {
+                        views.implements_type_args.insert(
+                            (class_qtn.clone(), iface_qtn.clone()),
+                            interface_type_args.clone(),
+                        );
+                    }
                 }
             }
             target_ty => {
@@ -526,28 +614,143 @@ fn derive_compatibility_views(
     views
 }
 
-fn lower_path_generic_args(
+#[allow(clippy::too_many_arguments)]
+fn lower_interface_associated_bindings(
     db: &dyn crate::Db,
-    expr: &baml_compiler2_ast::TypeExpr,
-    pkg_items: &baml_compiler2_hir::package::PackageItems<'_>,
-    namespace_path: &[Name],
+    iface: &baml_compiler2_hir::item_tree::Interface,
+    interface_args: &[Ty],
+    block_associated_bindings: &[baml_compiler2_ast::AssociatedTypeBindingDef],
+    iface_pkg_items: &baml_compiler2_hir::package::PackageItems<'_>,
+    binding_pkg_items: &baml_compiler2_hir::package::PackageItems<'_>,
+    iface_namespace_path: &[Name],
+    binding_namespace_path: &[Name],
     generic_params: &[Name],
     diagnostics: &mut Vec<crate::infer_context::TirTypeError>,
-) -> Vec<Ty> {
-    let baml_compiler2_ast::TypeExpr::Path { generic_args, .. } = expr else {
-        return Vec::new();
-    };
-    generic_args
+) -> Vec<(Name, Ty)> {
+    let mut bindings = generics::bind_type_vars(&iface.generic_params, interface_args);
+    for param in generic_params {
+        bindings
+            .entry(param.clone())
+            .or_insert_with(|| Ty::TypeVar(param.clone(), TyAttr::default()));
+    }
+
+    iface
+        .associated_types
         .iter()
-        .map(|arg| {
-            crate::lower_type_expr::lower_type_expr_in_ns(
-                db,
-                arg,
-                pkg_items,
-                namespace_path,
-                generic_params,
-                diagnostics,
-            )
+        .filter_map(|assoc| {
+            let ty = if let Some(binding) = block_associated_bindings
+                .iter()
+                .find(|binding| binding.name == assoc.name)
+                && let Some(type_expr) = &binding.type_expr
+            {
+                generics::lower_type_expr_with_generics(
+                    db,
+                    &type_expr.expr,
+                    binding_pkg_items,
+                    binding_namespace_path,
+                    &bindings,
+                    diagnostics,
+                )
+            } else {
+                let default = assoc.default.as_ref()?;
+                generics::lower_type_expr_with_generics(
+                    db,
+                    &default.expr,
+                    iface_pkg_items,
+                    iface_namespace_path,
+                    &bindings,
+                    diagnostics,
+                )
+            };
+            bindings.insert(assoc.name.clone(), ty.clone());
+            Some((assoc.name.clone(), ty))
+        })
+        .collect()
+}
+
+fn complete_interface_associated_bindings_from_tys(
+    db: &dyn crate::Db,
+    iface: &baml_compiler2_hir::item_tree::Interface,
+    interface_args: &[Ty],
+    associated_bindings: &[(Name, Ty)],
+    pkg_items: &baml_compiler2_hir::package::PackageItems<'_>,
+    iface_namespace_path: &[Name],
+    diagnostics: &mut Vec<crate::infer_context::TirTypeError>,
+) -> Vec<(Name, Ty)> {
+    let mut bindings = generics::bind_type_vars(&iface.generic_params, interface_args);
+    for (name, ty) in associated_bindings {
+        bindings.insert(name.clone(), ty.clone());
+    }
+
+    iface
+        .associated_types
+        .iter()
+        .filter_map(|assoc| {
+            if let Some((_, ty)) = associated_bindings
+                .iter()
+                .find(|(name, _)| name == &assoc.name)
+            {
+                let ty = generics::substitute_ty(ty, &bindings);
+                bindings.insert(assoc.name.clone(), ty.clone());
+                return Some((assoc.name.clone(), ty));
+            }
+            assoc.default.as_ref().map(|default| {
+                let ty = generics::lower_type_expr_with_generics(
+                    db,
+                    &default.expr,
+                    pkg_items,
+                    iface_namespace_path,
+                    &bindings,
+                    diagnostics,
+                );
+                bindings.insert(assoc.name.clone(), ty.clone());
+                (assoc.name.clone(), ty)
+            })
+        })
+        .collect()
+}
+
+fn lower_interface_type_associated_bindings(
+    ctx: InterfaceTypeAssocLowering<'_, '_>,
+    diagnostics: &mut Vec<crate::infer_context::TirTypeError>,
+) -> Vec<(Name, Ty)> {
+    let mut bindings = generics::bind_type_vars(&ctx.iface.generic_params, ctx.interface_args);
+    for (name, ty) in ctx.outer_bindings {
+        bindings.entry(name.clone()).or_insert_with(|| ty.clone());
+    }
+
+    ctx.iface
+        .associated_types
+        .iter()
+        .filter_map(|assoc| {
+            if let Some(binding) = ctx
+                .explicit_associated_bindings
+                .iter()
+                .find(|binding| binding.name == assoc.name)
+            {
+                let ty = generics::lower_type_expr_with_generics(
+                    ctx.db,
+                    &binding.ty,
+                    ctx.binding_pkg_items,
+                    ctx.binding_namespace_path,
+                    &bindings,
+                    diagnostics,
+                );
+                bindings.insert(assoc.name.clone(), ty.clone());
+                return Some((assoc.name.clone(), ty));
+            }
+            assoc.default.as_ref().map(|default| {
+                let ty = generics::lower_type_expr_with_generics(
+                    ctx.db,
+                    &default.expr,
+                    ctx.iface_pkg_items,
+                    ctx.iface_namespace_path,
+                    &bindings,
+                    diagnostics,
+                );
+                bindings.insert(assoc.name.clone(), ty.clone());
+                (assoc.name.clone(), ty)
+            })
         })
         .collect()
 }
@@ -580,7 +783,7 @@ fn validate_rule_bounds(
 
 fn interface_qtn(ty: &Ty) -> Option<&QualifiedTypeName> {
     match ty {
-        Ty::Interface(qtn, _, _) => Some(qtn),
+        Ty::Interface(qtn, _, _, _) => Some(qtn),
         _ => None,
     }
 }
@@ -619,11 +822,22 @@ fn match_ty_pattern_into(
 
     match (pattern, concrete) {
         (Ty::Class(p_qtn, p_args, _), Ty::Class(c_qtn, c_args, _))
-        | (Ty::Interface(p_qtn, p_args, _), Ty::Interface(c_qtn, c_args, _))
             if p_qtn == c_qtn && p_args.len() == c_args.len() =>
         {
             for (p, c) in p_args.iter().zip(c_args.iter()) {
                 match_ty_pattern_into(p, c, generic_params, aliases, bindings)?;
+            }
+            Some(())
+        }
+        (Ty::Interface(p_qtn, p_args, p_assoc, _), Ty::Interface(c_qtn, c_args, c_assoc, _))
+            if p_qtn == c_qtn && p_args.len() == c_args.len() =>
+        {
+            for (p, c) in p_args.iter().zip(c_args.iter()) {
+                match_ty_pattern_into(p, c, generic_params, aliases, bindings)?;
+            }
+            for (name, concrete_ty) in c_assoc {
+                let (_, pattern_ty) = p_assoc.iter().find(|(p_name, _)| p_name == name)?;
+                match_ty_pattern_into(pattern_ty, concrete_ty, generic_params, aliases, bindings)?;
             }
             Some(())
         }
@@ -858,9 +1072,16 @@ fn bind_type_var(
 fn contains_bound_typevar(ty: &Ty, generic_params: &[Name]) -> bool {
     match ty {
         Ty::TypeVar(name, _) => generic_params.contains(name),
-        Ty::Class(_, args, _) | Ty::Interface(_, args, _) | Ty::Union(args, _) => args
+        Ty::Class(_, args, _) | Ty::Union(args, _) => args
             .iter()
             .any(|arg| contains_bound_typevar(arg, generic_params)),
+        Ty::Interface(_, args, associated_bindings, _) => {
+            args.iter()
+                .any(|arg| contains_bound_typevar(arg, generic_params))
+                || associated_bindings
+                    .iter()
+                    .any(|(_, ty)| contains_bound_typevar(ty, generic_params))
+        }
         Ty::List(inner, _) | Ty::EvolvingList(inner, _) | Ty::Optional(inner, _) => {
             contains_bound_typevar(inner, generic_params)
         }
@@ -890,8 +1111,14 @@ fn contains_bound_typevar(ty: &Ty, generic_params: &[Name]) -> bool {
 
 fn contains_generic_function_binders(ty: &Ty) -> bool {
     match ty {
-        Ty::Class(_, args, _) | Ty::Interface(_, args, _) | Ty::Union(args, _) => {
+        Ty::Class(_, args, _) | Ty::Union(args, _) => {
             args.iter().any(contains_generic_function_binders)
+        }
+        Ty::Interface(_, args, associated_bindings, _) => {
+            args.iter().any(contains_generic_function_binders)
+                || associated_bindings
+                    .iter()
+                    .any(|(_, ty)| contains_generic_function_binders(ty))
         }
         Ty::List(inner, _) | Ty::EvolvingList(inner, _) | Ty::Optional(inner, _) => {
             contains_generic_function_binders(inner)
@@ -1004,10 +1231,33 @@ pub fn package_implements_registry<'db>(
                     let iface_qtn =
                         qualify_def(db, Definition::Interface(iface_loc), &iface_data.name);
                     let mut diags = Vec::new();
-                    let interface_args = lower_path_generic_args(
+                    let lowered_interface = crate::lower_type_expr::lower_type_expr_in_ns(
                         db,
                         &target.target.expr,
                         pkg_items,
+                        &class_ns,
+                        &class_data.generic_params,
+                        &mut diags,
+                    );
+                    let interface_args =
+                        if let Ty::Interface(_, interface_args, _, _) = lowered_interface {
+                            interface_args
+                        } else {
+                            Vec::new()
+                        };
+                    let iface_pkg_info =
+                        baml_compiler2_hir::file_package::file_package(db, iface_loc.file(db));
+                    let iface_pkg_id = PackageId::new(db, iface_pkg_info.package.clone());
+                    let iface_pkg_items = baml_compiler2_ppir::package_items(db, iface_pkg_id);
+                    let iface_namespace_path = iface_pkg_info.namespace_path;
+                    let associated_bindings = lower_interface_associated_bindings(
+                        db,
+                        iface_data,
+                        &interface_args,
+                        &target.associated_type_bindings,
+                        iface_pkg_items,
+                        pkg_items,
+                        &iface_namespace_path,
                         &class_ns,
                         &class_data.generic_params,
                         &mut diags,
@@ -1021,13 +1271,23 @@ pub fn package_implements_registry<'db>(
                             .collect(),
                         TyAttr::default(),
                     );
+                    let class_bound_tys = crate::builder::lower_generic_param_bounds(
+                        db,
+                        &class_data.generic_param_bounds,
+                        pkg_items,
+                        &class_ns,
+                        &class_data.generic_params,
+                        None,
+                        &mut diags,
+                    );
                     interface_impl_rules.push(InterfaceImplRule {
                         generic_params: class_data.generic_params.clone(),
-                        generic_param_bounds: vec![None; class_data.generic_params.len()],
+                        generic_param_bounds: class_bound_tys,
                         for_ty_pattern,
                         interface_ty: Ty::Interface(
                             iface_qtn.clone(),
                             interface_args,
+                            associated_bindings,
                             TyAttr::default(),
                         ),
                         origin: InterfaceImplOrigin::InBodyClass {
@@ -1068,7 +1328,7 @@ pub fn package_implements_registry<'db>(
                 &imp.generic_params,
                 &mut diags,
             );
-            let interface_args = lower_path_generic_args(
+            let lowered_interface = crate::lower_type_expr::lower_type_expr_in_ns(
                 db,
                 &imp.interface_target.expr,
                 pkg_items,
@@ -1076,8 +1336,34 @@ pub fn package_implements_registry<'db>(
                 &imp.generic_params,
                 &mut diags,
             );
-            let interface_ty =
-                Ty::Interface(iface_qtn.clone(), interface_args.clone(), TyAttr::default());
+            let interface_args = if let Ty::Interface(_, interface_args, _, _) = lowered_interface {
+                interface_args
+            } else {
+                Vec::new()
+            };
+            let iface_pkg_info =
+                baml_compiler2_hir::file_package::file_package(db, iface_loc.file(db));
+            let iface_pkg_id = PackageId::new(db, iface_pkg_info.package.clone());
+            let iface_pkg_items = baml_compiler2_ppir::package_items(db, iface_pkg_id);
+            let iface_namespace_path = iface_pkg_info.namespace_path;
+            let associated_bindings = lower_interface_associated_bindings(
+                db,
+                iface_data,
+                &interface_args,
+                &imp.associated_type_bindings,
+                iface_pkg_items,
+                pkg_items,
+                &iface_namespace_path,
+                &pkg_info.namespace_path,
+                &imp.generic_params,
+                &mut diags,
+            );
+            let interface_ty = Ty::Interface(
+                iface_qtn.clone(),
+                interface_args.clone(),
+                associated_bindings,
+                TyAttr::default(),
+            );
             let bounds: Vec<Option<Ty>> = imp
                 .generic_param_bounds
                 .iter()
@@ -1147,7 +1433,7 @@ pub fn resolve_path_to_interface_identity<'db>(
     current_ns: &[Name],
 ) -> Option<ResolvedInterface<'db>> {
     let mut diagnostics = Vec::new();
-    let Ty::Interface(qtn, _, _) = crate::lower_type_expr::lower_type_expr_in_ns(
+    let Ty::Interface(qtn, _, _, _) = crate::lower_type_expr::lower_type_expr_in_ns(
         db,
         target,
         pkg_items,
@@ -1260,34 +1546,33 @@ pub fn interface_closure_locs<'db>(
 /// Walk the transitive `requires` closure of `root_iface`, carrying the concrete
 /// generic arguments for each interface in the closure. For example,
 /// `Child<int> requires Parent<T>` yields `(Child, [int])` and `(Parent, [int])`.
-pub fn interface_closure_locs_with_args<'db>(
+/// Walk the transitive `requires` closure of `root_iface`, carrying generic
+/// arguments and associated type bindings for each interface in the closure.
+/// For example, `Child requires Parent<Item = int>` yields `(Child, [], [])`
+/// and `(Parent, [], [(Item, int)])`.
+pub fn interface_closure_locs_with_args_and_assoc<'db>(
     db: &'db dyn crate::Db,
     root_iface: baml_compiler2_hir::loc::InterfaceLoc<'db>,
     root_args: &[Ty],
+    root_associated_bindings: &[(Name, Ty)],
     _pkg_items: &baml_compiler2_hir::package::PackageItems<'db>,
     _current_ns: &[Name],
-) -> Vec<(baml_compiler2_hir::loc::InterfaceLoc<'db>, Vec<Ty>)> {
-    let mut out: Vec<(baml_compiler2_hir::loc::InterfaceLoc<'db>, Vec<Ty>)> = Vec::new();
-    let mut seen: FxHashSet<(baml_compiler2_hir::loc::InterfaceLoc<'db>, Vec<Ty>)> =
-        FxHashSet::default();
-    let mut queue: std::collections::VecDeque<(
-        baml_compiler2_hir::loc::InterfaceLoc<'db>,
-        Vec<Ty>,
-        FxHashSet<baml_compiler2_hir::loc::InterfaceLoc<'db>>,
-    )> = std::collections::VecDeque::new();
-    queue.push_back((root_iface, root_args.to_vec(), FxHashSet::default()));
+) -> Vec<InterfaceClosureEntry<'db>> {
+    let mut out: Vec<InterfaceClosureEntry<'db>> = Vec::new();
+    let mut seen: FxHashSet<InterfaceClosureEntry<'db>> = FxHashSet::default();
+    let mut queue: std::collections::VecDeque<InterfaceClosureQueueEntry<'db>> =
+        std::collections::VecDeque::new();
+    queue.push_back((
+        root_iface,
+        root_args.to_vec(),
+        root_associated_bindings.to_vec(),
+        FxHashSet::default(),
+    ));
 
-    while let Some((loc, args, ancestors)) = queue.pop_front() {
+    while let Some((loc, args, associated_bindings, ancestors)) = queue.pop_front() {
         if ancestors.contains(&loc) {
             continue;
         }
-        if !seen.insert((loc, args.clone())) {
-            continue;
-        }
-        out.push((loc, args.clone()));
-        let mut child_ancestors = ancestors.clone();
-        child_ancestors.insert(loc);
-
         let tree = baml_compiler2_hir::file_item_tree(db, loc.file(db));
         let Some(iface) = tree.interfaces.get(&loc.id(db)) else {
             continue;
@@ -1295,7 +1580,27 @@ pub fn interface_closure_locs_with_args<'db>(
         let pkg_info = baml_compiler2_hir::file_package::file_package(db, loc.file(db));
         let pkg_id = PackageId::new(db, pkg_info.package.clone());
         let parent_pkg_items = baml_compiler2_ppir::package_items(db, pkg_id);
-        let bindings = generics::bind_type_vars(&iface.generic_params, &args);
+        let mut diags = Vec::new();
+        let associated_bindings = complete_interface_associated_bindings_from_tys(
+            db,
+            iface,
+            &args,
+            &associated_bindings,
+            parent_pkg_items,
+            &pkg_info.namespace_path,
+            &mut diags,
+        );
+        if !seen.insert((loc, args.clone(), associated_bindings.clone())) {
+            continue;
+        }
+        out.push((loc, args.clone(), associated_bindings.clone()));
+        let mut child_ancestors = ancestors.clone();
+        child_ancestors.insert(loc);
+
+        let mut bindings = generics::bind_type_vars(&iface.generic_params, &args);
+        for (name, ty) in &associated_bindings {
+            bindings.insert(name.clone(), ty.clone());
+        }
 
         for parent in &iface.requires {
             let Some(parent_loc) = resolve_path_to_interface(
@@ -1325,7 +1630,48 @@ pub fn interface_closure_locs_with_args<'db>(
                 }
                 _ => Vec::new(),
             };
-            queue.push_back((parent_loc, parent_args, child_ancestors.clone()));
+            let parent_tree = baml_compiler2_hir::file_item_tree(db, parent_loc.file(db));
+            let Some(parent_iface) = parent_tree.interfaces.get(&parent_loc.id(db)) else {
+                continue;
+            };
+            let parent_pkg =
+                baml_compiler2_hir::file_package::file_package(db, parent_loc.file(db));
+            let parent_iface_pkg_id = PackageId::new(db, parent_pkg.package.clone());
+            let parent_iface_pkg_items =
+                baml_compiler2_ppir::package_items(db, parent_iface_pkg_id);
+            let (parent_explicit_assoc, parent_binding_ns): (
+                &[baml_compiler2_ast::AssociatedTypeBinding],
+                &[Name],
+            ) = match &parent.expr {
+                baml_compiler2_ast::TypeExpr::Path {
+                    associated_type_bindings,
+                    ..
+                } => (
+                    associated_type_bindings.as_slice(),
+                    &pkg_info.namespace_path,
+                ),
+                _ => (&[][..], &pkg_info.namespace_path),
+            };
+            let parent_assoc = lower_interface_type_associated_bindings(
+                InterfaceTypeAssocLowering {
+                    db,
+                    iface: parent_iface,
+                    interface_args: &parent_args,
+                    explicit_associated_bindings: parent_explicit_assoc,
+                    iface_pkg_items: parent_iface_pkg_items,
+                    binding_pkg_items: parent_pkg_items,
+                    iface_namespace_path: &parent_pkg.namespace_path,
+                    binding_namespace_path: parent_binding_ns,
+                    outer_bindings: &bindings,
+                },
+                &mut diags,
+            );
+            queue.push_back((
+                parent_loc,
+                parent_args,
+                parent_assoc,
+                child_ancestors.clone(),
+            ));
         }
     }
 
@@ -1349,7 +1695,7 @@ mod tests {
     }
 
     fn interface(name: &str, args: Vec<Ty>) -> Ty {
-        Ty::Interface(qtn(&[], name), args, TyAttr::default())
+        Ty::Interface(qtn(&[], name), args, vec![], TyAttr::default())
     }
 
     fn int() -> Ty {
@@ -1464,6 +1810,107 @@ mod tests {
         )
         .expect("nested list arg should bind T");
         assert_eq!(bindings.get(&Name::new("T")), Some(&int()));
+    }
+
+    #[test]
+    fn compatibility_type_implements_respects_generic_bounds() {
+        let dog_qtn = qtn(&[], "Dog");
+        let box_qtn = qtn(&[], "Box");
+        let named_qtn = qtn(&[], "Named");
+        let printable_qtn = qtn(&[], "Printable");
+        let rules = vec![
+            InterfaceImplRule {
+                generic_params: vec![],
+                generic_param_bounds: vec![],
+                for_ty_pattern: Ty::Class(dog_qtn.clone(), vec![], TyAttr::default()),
+                interface_ty: Ty::Interface(named_qtn.clone(), vec![], vec![], TyAttr::default()),
+                origin: InterfaceImplOrigin::InBodyClass { class_qtn: dog_qtn },
+            },
+            InterfaceImplRule {
+                generic_params: vec![Name::new("T")],
+                generic_param_bounds: vec![Some(Ty::Interface(
+                    named_qtn,
+                    vec![],
+                    vec![],
+                    TyAttr::default(),
+                ))],
+                for_ty_pattern: Ty::Class(box_qtn.clone(), vec![type_var("T")], TyAttr::default()),
+                interface_ty: Ty::Interface(
+                    printable_qtn.clone(),
+                    vec![],
+                    vec![],
+                    TyAttr::default(),
+                ),
+                origin: InterfaceImplOrigin::InBodyClass {
+                    class_qtn: box_qtn.clone(),
+                },
+            },
+        ];
+        let views = derive_compatibility_views(&rules, std::slice::from_ref(&box_qtn));
+        let mut registry = ImplementsRegistry {
+            interface_impl_rule_index: InterfaceImplRuleIndex::from_rules(&rules),
+            interface_impl_rules: rules,
+            class_implements: views.class_implements,
+            type_implements: views.type_implements,
+            blanket_class_implements: views.blanket_class_implements,
+            implements_type_args: views.implements_type_args,
+            type_implements_type_args: views.type_implements_type_args,
+            interface_requires: FxHashMap::default(),
+        };
+
+        assert!(!registry.implements(&box_qtn, &printable_qtn));
+        assert!(registry.type_implements(
+            &Ty::Class(
+                box_qtn.clone(),
+                vec![Ty::Class(qtn(&[], "Dog"), vec![], TyAttr::default())],
+                TyAttr::default(),
+            ),
+            &printable_qtn,
+        ));
+        assert!(!registry.type_implements(
+            &Ty::Class(box_qtn, vec![int()], TyAttr::default()),
+            &printable_qtn,
+        ));
+
+        registry.class_implements.clear();
+        assert!(!registry.type_implements(
+            &Ty::Class(qtn(&[], "Box"), vec![int()], TyAttr::default()),
+            &printable_qtn,
+        ));
+    }
+
+    #[test]
+    fn contains_bound_typevar_checks_interface_associated_bindings() {
+        let ty = Ty::Interface(
+            qtn(&[], "Source"),
+            vec![],
+            vec![(
+                Name::new("Item"),
+                Ty::List(Box::new(type_var("T")), TyAttr::default()),
+            )],
+            TyAttr::default(),
+        );
+
+        assert!(contains_bound_typevar(&ty, &[Name::new("T")]));
+        assert!(!contains_bound_typevar(&ty, &[Name::new("U")]));
+    }
+
+    #[test]
+    fn contains_generic_function_binders_checks_interface_associated_bindings() {
+        let ty = Ty::Interface(
+            qtn(&[], "Source"),
+            vec![],
+            vec![(
+                Name::new("Item"),
+                Ty::List(
+                    Box::new(function(vec!["T"], vec![None], vec![type_var("T")], int())),
+                    TyAttr::default(),
+                ),
+            )],
+            TyAttr::default(),
+        );
+
+        assert!(contains_generic_function_binders(&ty));
     }
 
     #[test]

@@ -174,11 +174,14 @@ impl BexEngine {
                         .zip(instance.fields.iter())
                         .map(|(class_field, slot)| {
                             let value = slot.load();
+                            let field_type = class_field
+                                .field_template
+                                .substitute(&instance.class_type_args);
                             Ok((
                                 class_field.name.clone(),
                                 self.convert_vm_value_to_external_with_type(
                                     value,
-                                    &class_field.field_type,
+                                    &field_type,
                                     permit,
                                 )?,
                             ))
@@ -243,6 +246,9 @@ impl BexEngine {
             }),
             Object::BoundMethod(_) => Err(EngineError::CannotConvert {
                 type_name: "bound_method".to_string(),
+            }),
+            Object::GenericFunction(_) => Err(EngineError::CannotConvert {
+                type_name: "generic_function".to_string(),
             }),
             Object::HostClosure(_) => Err(EngineError::CannotConvert {
                 type_name: "host_closure".to_string(),
@@ -856,7 +862,7 @@ impl BexEngine {
     /// the shared guard cannot perform — class *field types* — by resolving
     /// the declared class against the engine's compiled schema
     /// (`resolved_class_names`) and recursively validating each declared
-    /// field's value against its declared `ClassField::field_type`.
+    /// field's value against its instantiated field type.
     ///
     /// Returns `Err(message)` describing the first mismatch; the caller maps
     /// it to an `OpErrorKind::HostCallable` so it surfaces as a catchable
@@ -942,7 +948,7 @@ impl BexEngine {
             // class — accepting it would hand back a value that cannot inhabit
             // the declared return type. A host returning a class must encode it
             // as a class value (→ `Instance`), not a plain map.
-            Ty::Class(tn, _, _) => match value {
+            Ty::Class(tn, expected_args, _) => match value {
                 BexExternalValue::Instance { class_name, fields } => {
                     if !type_name_matches_external_name(class_name, tn) {
                         return Err(format!(
@@ -971,7 +977,8 @@ impl BexEngine {
                     };
                     for class_field in &class.fields {
                         if let Some(field_value) = fields.get(&class_field.name) {
-                            self.validate_host_return_schema(field_value, &class_field.field_type)?;
+                            let field_ty = class_field.field_template.substitute(expected_args);
+                            self.validate_host_return_schema(field_value, &field_ty)?;
                         }
                         // Missing fields are reported by
                         // `convert_external_to_vm_value` at materialization.
@@ -1143,6 +1150,7 @@ fn find_matching_union_member(value: Value, members: &[Ty]) -> Option<&Ty> {
                 Object::Function(_)
                 | Object::Closure(_)
                 | Object::BoundMethod(_)
+                | Object::GenericFunction(_)
                 | Object::HostClosure(_)
                 | Object::Cell(_)
                 | Object::Class(_)
@@ -1251,6 +1259,7 @@ pub(crate) fn vm_arg_to_external(vm: &BexVm, value: Value) -> BexExternalValue {
                 Object::Function(_)
                 | Object::Closure(_)
                 | Object::BoundMethod(_)
+                | Object::GenericFunction(_)
                 | Object::HostClosure(_)
                 | Object::Cell(_)
                 | Object::Class(_)

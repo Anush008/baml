@@ -29,7 +29,7 @@ fn init() {
 
 #[napi]
 pub fn get_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    baml_version::CANONICAL_VERSION
 }
 
 /// No-op: tracing has been removed. Kept as a live symbol for ABI stability.

@@ -125,6 +125,14 @@ fn collect_from_stmt<C: ThrowsAnalysisContext>(
                 collect_from_stmt(context, *after_stmt, body, out);
             }
         }
+        Stmt::WhileLet {
+            scrutinee,
+            body: while_body,
+            ..
+        } => {
+            collect_from_expr(context, *scrutinee, body, out);
+            collect_from_expr(context, *while_body, body, out);
+        }
         Stmt::For {
             collection,
             body: for_body,
@@ -304,6 +312,9 @@ fn collect_from_expr<C: ThrowsAnalysisContext>(
         }
         Expr::Await { future } => {
             collect_from_expr(context, *future, body, out);
+        }
+        Expr::GenericApply { base, .. } => {
+            collect_from_expr(context, *base, body, out);
         }
         Expr::Lambda(_)
         | Expr::Literal(_)

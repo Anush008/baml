@@ -324,6 +324,12 @@ struct LoweringContext {
     /// Expressions that contain unwrapped `?.` operators and need an `OptionalChain` wrapper.
     /// Propagated up through chain-continuing nodes (`FieldAccess`, Index, Call, Optional*).
     needs_chain_wrap: std::collections::HashSet<ExprId>,
+    /// Text ranges of `GENERIC_ARGS` nodes that an enclosing call has already
+    /// consumed as call-site `type_args` (e.g. the `<int>` in `foo<int>(x)`).
+    /// `lower_path_expr` skips wrapping these into an `Expr::GenericApply` so the
+    /// args aren't double-counted. Only standalone, value-position `<...>` (e.g.
+    /// `let f = foo<int>`) becomes a `GenericApply`.
+    consumed_generic_args: std::collections::HashSet<TextRange>,
 }
 
 impl LoweringContext {
@@ -341,6 +347,7 @@ impl LoweringContext {
             diags: Vec::new(),
             env_var_refs: Vec::new(),
             needs_chain_wrap: std::collections::HashSet::new(),
+            consumed_generic_args: std::collections::HashSet::new(),
         }
     }
 
@@ -517,6 +524,7 @@ impl LoweringContext {
                         SyntaxKind::RETURN_STMT => self.lower_return_stmt(node),
                         SyntaxKind::THROW_STMT => self.lower_throw_stmt(node),
                         SyntaxKind::WHILE_STMT => self.lower_while_stmt(node),
+                        SyntaxKind::WHILE_LET_STMT => self.lower_while_let_stmt(node),
                         SyntaxKind::FOR_EXPR => self.lower_for_stmt(node),
                         SyntaxKind::BREAK_STMT => self.alloc_stmt(Stmt::Break, node.text_range()),
                         SyntaxKind::CONTINUE_STMT => {
@@ -1218,6 +1226,52 @@ impl LoweringContext {
         )
     }
 
+    fn lower_while_let_stmt(&mut self, node: &SyntaxNode) -> StmtId {
+        // CST shape: `while let PATTERN = SCRUTINEE BODY_BLOCK`.
+        // The first PATTERN node is the pattern; remaining children are
+        // [0]=scrutinee, [1]=body (mirrors `lower_if_let_expr` minus else).
+        let mut pattern = None;
+        let mut exprs: Vec<ExprId> = Vec::new();
+        for elem in node.children_with_tokens() {
+            match elem {
+                rowan::NodeOrToken::Node(child) => {
+                    if child.kind() == SyntaxKind::PATTERN {
+                        if pattern.is_none() {
+                            pattern = Some(self.lower_pattern(&child));
+                        }
+                    } else {
+                        exprs.push(self.lower_expr(&child));
+                    }
+                }
+                rowan::NodeOrToken::Token(token) => {
+                    if let Some(expr_id) = self.try_lower_bare_token(&token) {
+                        exprs.push(expr_id);
+                    }
+                }
+            }
+        }
+
+        let pattern =
+            pattern.unwrap_or_else(|| self.alloc_pattern(Pattern::Wildcard, node.text_range()));
+        let scrutinee = exprs
+            .first()
+            .copied()
+            .unwrap_or_else(|| self.alloc_expr(Expr::Missing, node.text_range()));
+        let body = exprs
+            .get(1)
+            .copied()
+            .unwrap_or_else(|| self.alloc_expr(Expr::Missing, node.text_range()));
+
+        self.alloc_stmt(
+            Stmt::WhileLet {
+                pattern,
+                scrutinee,
+                body,
+            },
+            node.text_range(),
+        )
+    }
+
     fn lower_match_expr(&mut self, node: &SyntaxNode) -> ExprId {
         let mut scrutinee = None;
         let mut scrutinee_type = None;
@@ -1583,7 +1637,7 @@ impl LoweringContext {
     /// Lower a `DESTRUCTURE_PATTERN` (`(let)? PATH ('<' types '>')? '{' field_list '}'`).
     fn lower_destructure_pattern(&mut self, node: &SyntaxNode) -> PatId {
         // Path tokens live between (the optional) `KW_LET` and either
-        // `GENERIC_ARGS` or `L_BRACE`.
+        // `GENERIC_ARGS`, `TYPE_ARGS`, or `L_BRACE`.
         // Collect WORD tokens in that range, ignoring DOTs.
         let mut class: Vec<Name> = Vec::new();
         for elem in node.children_with_tokens() {
@@ -1594,19 +1648,35 @@ impl LoweringContext {
                     SyntaxKind::L_BRACE => break,
                     _ => {}
                 },
-                rowan::NodeOrToken::Node(n) if n.kind() == SyntaxKind::GENERIC_ARGS => break,
+                rowan::NodeOrToken::Node(n)
+                    if n.kind() == SyntaxKind::GENERIC_ARGS
+                        || n.kind() == SyntaxKind::TYPE_ARGS =>
+                {
+                    break;
+                }
                 rowan::NodeOrToken::Node(_) => {}
             }
         }
 
-        let generic_args: Vec<TypeExpr> = node
+        let args_node = node
             .children()
-            .find(|n| n.kind() == SyntaxKind::GENERIC_ARGS)
+            .find(|n| n.kind() == SyntaxKind::GENERIC_ARGS || n.kind() == SyntaxKind::TYPE_ARGS);
+
+        let generic_args: Vec<TypeExpr> = args_node
+            .as_ref()
             .into_iter()
-            .flat_map(|args_node| args_node.children())
+            .flat_map(rowan::SyntaxNode::children)
             .filter(|n| n.kind() == SyntaxKind::TYPE_EXPR)
             .filter_map(baml_compiler_syntax::ast::TypeExpr::cast)
             .map(|te| crate::lower_type_expr::lower_type_expr_node(&te))
+            .collect();
+
+        let associated_type_bindings = args_node
+            .into_iter()
+            .filter(|args_node| args_node.kind() == SyntaxKind::TYPE_ARGS)
+            .flat_map(|args_node| args_node.children())
+            .filter_map(baml_compiler_syntax::ast::AssociatedTypeDecl::cast)
+            .filter_map(|binding| crate::lower_type_expr::lower_associated_type_binding(&binding))
             .collect();
 
         let fields: Vec<FieldPat> = node
@@ -1619,6 +1689,7 @@ impl LoweringContext {
             Pattern::Class {
                 class,
                 generic_args,
+                associated_type_bindings,
                 fields,
             },
             node.text_range(),
@@ -2019,15 +2090,26 @@ impl LoweringContext {
         //      type-args so the BEP-039 type-arg channel seeds the static
         //      method's frame correctly (e.g. `Box.from_json` sees
         //      `T = Secret`).
-        let type_args: Vec<TypeExpr> = callee_node
+        let callee_generic_args = callee_node.as_ref().and_then(find_callee_generic_args);
+        let type_args: Vec<TypeExpr> = callee_generic_args
             .as_ref()
-            .and_then(find_callee_generic_args)
-            .into_iter()
-            .flat_map(|args_node| args_node.children())
-            .filter(|n| n.kind() == SyntaxKind::TYPE_EXPR)
-            .filter_map(baml_compiler_syntax::ast::TypeExpr::cast)
-            .map(|te| crate::lower_type_expr::lower_type_expr_node(&te))
-            .collect();
+            .map(Self::lower_generic_args_node)
+            .unwrap_or_default();
+        // Mark EVERY `GENERIC_ARGS` node in the callee subtree as consumed, so
+        // lowering the callee/receiver below does not wrap any of them into an
+        // `Expr::GenericApply`. `foo<int>(x)` keeps its callee a plain path (the
+        // `<int>` lives on the `Call`); for `Container<int>.method<U>(x)` the
+        // call uses the method-level `<U>` as its type args while the receiver
+        // `<int>` fills the class's generic params (BEP-039) — neither is a
+        // value-position instantiation, so both must be suppressed here.
+        if let Some(n) = &callee_node {
+            for ga in n
+                .descendants()
+                .filter(|d| d.kind() == SyntaxKind::GENERIC_ARGS)
+            {
+                self.consumed_generic_args.insert(ga.text_range());
+            }
+        }
 
         let callee = if let Some(n) = callee_node {
             self.lower_expr_in_chain(&n)
@@ -2147,6 +2229,35 @@ impl LoweringContext {
         Some((CallArg { label, expr }, label_span))
     }
 
+    /// Lower the `TYPE_EXPR` children of a `GENERIC_ARGS` node to `TypeExpr`s.
+    fn lower_generic_args_node(ga: &SyntaxNode) -> Vec<TypeExpr> {
+        ga.children()
+            .filter(|n| n.kind() == SyntaxKind::TYPE_EXPR)
+            .filter_map(baml_compiler_syntax::ast::TypeExpr::cast)
+            .map(|te| crate::lower_type_expr::lower_type_expr_node(&te))
+            .collect()
+    }
+
+    /// If `node` has a direct, unconsumed `GENERIC_ARGS` child, wrap `base` in an
+    /// `Expr::GenericApply` carrying its type args; otherwise return `base`.
+    /// `range` spans the whole instantiation (`foo<int>`).
+    fn wrap_generic_apply(&mut self, node: &SyntaxNode, base: ExprId, range: TextRange) -> ExprId {
+        let Some(ga) = node
+            .children()
+            .find(|n| n.kind() == SyntaxKind::GENERIC_ARGS)
+        else {
+            return base;
+        };
+        if self.consumed_generic_args.contains(&ga.text_range()) {
+            return base;
+        }
+        let type_args = Self::lower_generic_args_node(&ga);
+        if type_args.is_empty() {
+            return base;
+        }
+        self.alloc_expr(Expr::GenericApply { base, type_args }, range)
+    }
+
     fn lower_path_expr(&mut self, node: &SyntaxNode) -> ExprId {
         // PATH_EXPR contains WORD (or keyword-as-ident) tokens joined by DOTs.
         //
@@ -2165,10 +2276,21 @@ impl LoweringContext {
         }
 
         if segments.is_empty() {
-            // Check for a nested PATH_EXPR child (produced by the parser when
-            // `foo.bar<T>` wraps the `foo.bar` PATH_EXPR in an outer PATH_EXPR).
-            if let Some(inner) = node.children().find(|n| n.kind() == SyntaxKind::PATH_EXPR) {
-                return self.lower_path_expr(&inner);
+            // An outer PATH_EXPR with no direct ident tokens wraps an inner
+            // expression plus a `GENERIC_ARGS` annotation. The parser produces
+            // this for any `<receiver><...>` value whose receiver is itself a
+            // compound expression: `foo.bar<int>` (inner PATH_EXPR), but also
+            // `(b).foo<int>`, `b?.foo<int>`, `arr[0].foo<int>`, `g().foo<int>`
+            // (inner FIELD_ACCESS_EXPR / OPTIONAL_FIELD_ACCESS_EXPR / INDEX_EXPR
+            // / CALL_EXPR / PAREN_EXPR). Lower the inner expression through the
+            // normal chain dispatch and capture the `GENERIC_ARGS` here, so the
+            // receiver and type args are never silently dropped.
+            if let Some(inner) = node
+                .children()
+                .find(|n| n.kind() != SyntaxKind::GENERIC_ARGS)
+            {
+                let base = self.lower_expr_in_chain(&inner);
+                return self.wrap_generic_apply(node, base, node.text_range());
             }
             return self.alloc_expr(Expr::Missing, node.text_range());
         }
@@ -2195,7 +2317,9 @@ impl LoweringContext {
             let spans: Vec<TextRange> = segments.iter().map(|(_, r)| *r).collect();
             self.source_map.path_segment_spans.insert(id, spans);
         }
-        id
+        // `foo<int>` in value position: the GENERIC_ARGS is a direct child of
+        // this PATH_EXPR. Wrap unless an enclosing call already consumed it.
+        self.wrap_generic_apply(node, id, node.text_range())
     }
 
     fn lower_field_access_expr(&mut self, node: &SyntaxNode) -> ExprId {
@@ -3357,6 +3481,7 @@ impl LoweringContext {
                 expr: TypeExpr::Path {
                     segments: vec![Name::new("testing"), Name::new("TestCollector")],
                     generic_args: vec![],
+                    associated_type_bindings: vec![],
                     attrs: vec![],
                 },
                 span,

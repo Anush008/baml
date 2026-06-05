@@ -657,6 +657,10 @@ fn expr_desc_spans<'db>(
             spans.push(DetailSpan::Code("await ".into()));
             spans.extend(expr_desc_spans(*future, body, inference));
         }
+        Expr::GenericApply { base, .. } => {
+            spans.extend(expr_desc_spans(*base, body, inference));
+            spans.push(DetailSpan::Code("<...>".into()));
+        }
         Expr::Missing => {
             spans.push(DetailSpan::Code("<missing>".into()));
         }
@@ -2120,6 +2124,7 @@ impl CompilerRunner {
                     format!("spawn {{ {} }}", expr_desc(*spawn_body, body))
                 }
                 Expr::Await { future } => format!("await {}", expr_desc(*future, body)),
+                Expr::GenericApply { base, .. } => format!("{}<...>", expr_desc(*base, body)),
                 Expr::Missing => "<missing>".into(),
             }
         }
@@ -2570,6 +2575,25 @@ impl CompilerRunner {
                         } => {
                             let cond_desc = expr_desc(*condition, body);
                             let line = format!("{pad}while {cond_desc}");
+                            writeln!(output, "{line}").ok();
+                            output_annotated.push((line, status));
+                            render_expr(
+                                *body_expr,
+                                body,
+                                inference,
+                                indent + 2,
+                                output,
+                                output_annotated,
+                                status,
+                            );
+                        }
+                        Stmt::WhileLet {
+                            scrutinee,
+                            body: body_expr,
+                            ..
+                        } => {
+                            let scrut_desc = expr_desc(*scrutinee, body);
+                            let line = format!("{pad}while let ... = {scrut_desc}");
                             writeln!(output, "{line}").ok();
                             output_annotated.push((line, status));
                             render_expr(
@@ -3267,6 +3291,17 @@ impl CompilerRunner {
                             let mut line = vec![DetailSpan::Code(format!("{pad}  while ("))];
                             line.extend(expr_desc_spans(*condition, body, inference));
                             line.push(DetailSpan::Code(")".into()));
+                            lines.push(line);
+                            Self::render_expr_to_lines(*wb, body, inference, indent + 4, lines);
+                        }
+                        Stmt::WhileLet {
+                            scrutinee,
+                            body: wb,
+                            ..
+                        } => {
+                            let mut line =
+                                vec![DetailSpan::Code(format!("{pad}  while let ... = "))];
+                            line.extend(expr_desc_spans(*scrutinee, body, inference));
                             lines.push(line);
                             Self::render_expr_to_lines(*wb, body, inference, indent + 4, lines);
                         }
@@ -5239,6 +5274,7 @@ fn format_vm_value(value: &bex_vm_types::Value, vm: &bex_vm::BexVm) -> String {
                 Object::Type(ty) => format!("<type: {ty}>"),
                 Object::Closure(c) => format!("<closure captures={}>", c.captures.len()),
                 Object::BoundMethod(_) => "<bound_method>".to_string(),
+                Object::GenericFunction(_) => "<generic_function>".to_string(),
                 Object::HostClosure(_) => "<host_closure>".to_string(),
                 Object::Cell(c) => format!("<cell {}>", format_vm_value(&c.load(), vm)),
                 Object::Bigint(bi) => bi.to_string(),
