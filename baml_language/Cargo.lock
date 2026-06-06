@@ -717,7 +717,6 @@ dependencies = [
  "console",
  "ctrlc",
  "flate2",
- "indexmap",
  "indicatif",
  "insta",
  "libsui",
@@ -735,14 +734,12 @@ dependencies = [
  "text-size",
  "tokio",
  "toml 0.8.23",
- "zip",
 ]
 
 [[package]]
 name = "baml_codegen_types"
 version = "0.0.0-beta"
 dependencies = [
- "anyhow",
  "baml_base",
  "strum",
 ]
@@ -759,7 +756,6 @@ dependencies = [
  "la-arena",
  "num-bigint",
  "rowan 0.16.1",
- "rustc-hash 2.1.2",
  "smol_str 0.3.6",
  "text-size",
 ]
@@ -809,12 +805,10 @@ dependencies = [
  "baml_compiler2_tir",
  "baml_type",
  "indexmap",
- "log",
  "num-bigint",
  "rustc-hash 2.1.2",
  "salsa",
  "smol_str 0.3.6",
- "text-size",
 ]
 
 [[package]]
@@ -840,11 +834,9 @@ dependencies = [
  "baml_compiler2_ast",
  "baml_compiler2_hir",
  "baml_compiler2_ppir",
- "baml_compiler_diagnostics",
  "baml_type",
  "baml_workspace",
  "indexmap",
- "la-arena",
  "num-bigint",
  "rustc-hash 2.1.2",
  "salsa",
@@ -869,8 +861,6 @@ version = "0.0.0-beta"
 dependencies = [
  "ariadne",
  "baml_base",
- "baml_workspace",
- "salsa",
  "text-size",
 ]
 
@@ -979,7 +969,6 @@ dependencies = [
 name = "baml_lsp2_actions_tests"
 version = "0.0.0-beta"
 dependencies = [
- "baml_base",
  "baml_compiler_diagnostics",
  "baml_lsp2_actions",
  "baml_project",
@@ -999,7 +988,6 @@ dependencies = [
  "anyhow",
  "axum",
  "baml_compiler2_visualization",
- "baml_type",
  "baml_version",
  "base64",
  "bex_events",
@@ -1010,9 +998,7 @@ dependencies = [
  "crossbeam-channel",
  "futures",
  "indexmap",
- "log",
  "lsp-server",
- "parking_lot",
  "prost",
  "regex",
  "reqwest",
@@ -1022,14 +1008,11 @@ dependencies = [
  "sys_native",
  "sys_ops",
  "sys_types",
- "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
  "tower-http",
  "tracing",
- "tracing-log",
  "tracing-subscriber",
- "url",
  "vfs",
  "webbrowser",
 ]
@@ -1066,10 +1049,8 @@ dependencies = [
  "bex_vm_types",
  "la-arena",
  "lsp-types",
- "rowan 0.16.1",
  "salsa",
  "serde",
- "serde_json",
  "text-size",
 ]
 
@@ -1092,7 +1073,6 @@ dependencies = [
 name = "baml_tests"
 version = "0.0.0-beta"
 dependencies = [
- "anyhow",
  "baml_base",
  "baml_compiler2_ast",
  "baml_compiler2_emit",
@@ -1115,7 +1095,6 @@ dependencies = [
  "darwin-kperf-events",
  "indexmap",
  "insta",
- "la-arena",
  "num-bigint",
  "prettyplease",
  "proc-macro2",
@@ -1198,10 +1177,7 @@ dependencies = [
  "bex_vm_types",
  "bridge_ctypes",
  "futures",
- "futures-timer",
  "indexmap",
- "insta",
- "log",
  "num-bigint",
  "prost",
  "serde_json",
@@ -1259,17 +1235,14 @@ dependencies = [
  "bex_vm_types",
  "indexmap",
  "num-bigint",
- "once_cell",
 ]
 
 [[package]]
 name = "bex_heap"
 version = "0.0.0-beta"
 dependencies = [
- "baml_builtins2",
  "baml_type",
  "bex_external_types",
- "bex_resource_types",
  "bex_str",
  "bex_vm_types",
  "indexmap",
@@ -1286,14 +1259,12 @@ dependencies = [
  "async-trait",
  "baml_base",
  "baml_builtins2",
- "baml_compiler2_emit",
  "baml_compiler2_visualization",
  "baml_compiler_diagnostics",
  "baml_db",
  "baml_fmt",
  "baml_lsp2_actions",
  "baml_project",
- "baml_type",
  "baml_version",
  "baml_workspace",
  "bex_engine",
@@ -1302,7 +1273,6 @@ dependencies = [
  "bex_heap",
  "bex_vm_types",
  "borsh",
- "crossbeam-channel",
  "log",
  "lsp-server",
  "lsp-types",
@@ -1319,7 +1289,6 @@ dependencies = [
  "tracing",
  "vfs",
  "wasm-bindgen-futures",
- "web-time",
 ]
 
 [[package]]
@@ -1343,11 +1312,8 @@ dependencies = [
  "num-bigint",
  "ouroboros",
  "regex",
- "rowan 0.16.1",
- "salsa",
  "serde",
  "serde_json",
- "strsim",
  "sys_types",
  "thiserror 2.0.18",
  "unicode-normalization",
@@ -1357,10 +1323,8 @@ dependencies = [
 name = "bex_str"
 version = "0.1.0"
 dependencies = [
- "ahash",
  "bytecount",
  "codspeed-divan-compat",
- "getrandom 0.3.4",
  "indexmap",
 ]
 
@@ -1368,7 +1332,6 @@ dependencies = [
 name = "bex_vm"
 version = "0.0.0-beta"
 dependencies = [
- "anyhow",
  "baml_builtins2",
  "baml_builtins2_codegen",
  "baml_project",
@@ -1376,10 +1339,8 @@ dependencies = [
  "base64",
  "bex_events",
  "bex_heap",
- "bex_resource_types",
  "bex_str",
  "bex_vm_types",
- "codspeed-divan-compat",
  "console",
  "getrandom 0.2.17",
  "indexmap",
@@ -1387,9 +1348,7 @@ dependencies = [
  "num-bigint",
  "serde_json",
  "smallvec",
- "thiserror 2.0.18",
  "time",
- "tokio",
  "toml 0.8.23",
  "web-time",
 ]
@@ -1398,7 +1357,6 @@ dependencies = [
 name = "bex_vm_types"
 version = "0.0.0-beta"
 dependencies = [
- "anyhow",
  "baml_base",
  "baml_builtins2",
  "baml_builtins2_codegen",
@@ -1406,7 +1364,6 @@ dependencies = [
  "bex_resource_types",
  "bex_str",
  "borsh",
- "codspeed-divan-compat",
  "indexmap",
  "num-bigint",
  "thiserror 2.0.18",
@@ -1527,7 +1484,6 @@ dependencies = [
  "bex_events_native",
  "bex_project",
  "bridge_ctypes",
- "cbindgen",
  "futures",
  "indexmap",
  "libc",
@@ -1538,7 +1494,6 @@ dependencies = [
  "sys_types",
  "thiserror 2.0.18",
  "tokio",
- "tokio-util",
  "vfs",
 ]
 
@@ -1549,7 +1504,6 @@ dependencies = [
  "baml_type",
  "bex_events",
  "bex_project",
- "bex_resource_types",
  "indexmap",
  "num-bigint",
  "prost",
@@ -1575,7 +1529,6 @@ dependencies = [
  "prost",
  "serde_json",
  "sys_native",
- "tokio",
 ]
 
 [[package]]
@@ -1602,11 +1555,9 @@ dependencies = [
 name = "bridge_wasm"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "baml_type",
  "baml_version",
  "bex_events",
- "bex_heap",
  "bex_project",
  "bridge_ctypes",
  "bytes",
@@ -1825,25 +1776,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dec551ab6e7578819132c713a93c022a05d60159dc86e7a7050223577484c55a"
 dependencies = [
  "rustversion",
-]
-
-[[package]]
-name = "cbindgen"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eadd868a2ce9ca38de7eeafdcec9c7065ef89b42b32f0839278d55f35c54d1ff"
-dependencies = [
- "clap",
- "heck 0.4.1",
- "indexmap",
- "log",
- "proc-macro2",
- "quote",
- "serde",
- "serde_json",
- "syn 2.0.117",
- "tempfile",
- "toml 0.8.23",
 ]
 
 [[package]]
@@ -2451,12 +2383,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "diff"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2939,7 +2865,6 @@ dependencies = [
  "async-trait",
  "forked_aws_sigv4",
  "hex",
- "serde",
  "serde_json",
  "sha1",
  "tokio",
@@ -3080,16 +3005,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "037711b3d59c33004d3856fbdc83b99d4ff37a24768fa1be9ce3538a1cde4393"
 
 [[package]]
-name = "futures-timer"
-version = "3.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af43fadb8a98512d547e37b4e92e0ced13e205c061b87b4623eff01d918d6968"
-dependencies = [
- "gloo-timers",
- "send_wrapper",
-]
-
-[[package]]
 name = "futures-util"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3203,18 +3118,6 @@ dependencies = [
  "log",
  "regex-automata",
  "regex-syntax 0.8.10",
-]
-
-[[package]]
-name = "gloo-timers"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "482ce8a491a501da4cd806bd190275363d674f2845005c6ddbd5d3e1dd54495d"
-dependencies = [
- "futures-channel",
- "futures-core",
- "js-sys",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -5506,16 +5409,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8cf8e6a8aa66ce33f63993ffc4ea4271eb5b0530a9002db8455ea6050c77bfa"
 
 [[package]]
-name = "pretty_assertions"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ae130e2f271fbc2ac3a40fb1d07180839cdbbe443c7a27e1e3c13c5cac0116d"
-dependencies = [
- "diff",
- "yansi",
-]
-
-[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6481,7 +6374,6 @@ dependencies = [
  "askama",
  "baml_base",
  "baml_codegen_types",
- "pretty_assertions",
 ]
 
 [[package]]
@@ -6524,12 +6416,6 @@ dependencies = [
  "serde",
  "serde_core",
 ]
-
-[[package]]
-name = "send_wrapper"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd0b0ec5f1c1ca621c432a25813d8d60c88abe6d3e08a3eb9cf37d97a0fe3d73"
 
 [[package]]
 name = "serde"
@@ -7047,7 +6933,6 @@ dependencies = [
 name = "sys_llm"
 version = "0.0.0-beta"
 dependencies = [
- "anyhow",
  "async-trait",
  "baml_base",
  "baml_builtins2",
@@ -7066,8 +6951,6 @@ dependencies = [
  "indexmap",
  "infer",
  "minijinja",
- "percent-encoding",
- "regex",
  "rsa",
  "rustls",
  "serde",
@@ -7078,7 +6961,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "url",
- "wasm-bindgen-test",
  "web-time",
 ]
 
@@ -7140,7 +7022,6 @@ dependencies = [
  "bex_vm_types",
  "indexmap",
  "num-bigint",
- "thiserror 2.0.18",
  "tokio",
  "tokio-util",
 ]
@@ -7555,7 +7436,6 @@ dependencies = [
  "arboard",
  "baml_base",
  "baml_compiler2_ast",
- "baml_compiler2_emit",
  "baml_compiler2_hir",
  "baml_compiler2_ppir",
  "baml_compiler2_tir",
@@ -7566,7 +7446,6 @@ dependencies = [
  "baml_db",
  "baml_fmt",
  "baml_project",
- "baml_type",
  "baml_workspace",
  "bex_vm",
  "bex_vm_types",
@@ -7578,7 +7457,6 @@ dependencies = [
  "rowan 0.16.1",
  "salsa",
  "similar",
- "text-size",
 ]
 
 [[package]]
@@ -7685,18 +7563,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
- "valuable",
-]
-
-[[package]]
-name = "tracing-log"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
-dependencies = [
- "log",
- "once_cell",
- "tracing-core",
 ]
 
 [[package]]
@@ -7990,12 +7856,6 @@ dependencies = [
  "serde_core",
  "wasm-bindgen",
 ]
-
-[[package]]
-name = "valuable"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vcpkg"
