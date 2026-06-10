@@ -207,6 +207,64 @@ pub(super) fn make_to_json_callee(vm: &mut BexVm, v: Value) -> Result<HeapPtr, V
     }))
 }
 
+/// For a value `v` whose type implements `baml.Comparable`, look up the
+/// matching `compare` function and return a `BoundMethod { compare, receiver: v }`.
+///
+/// Builtin impls are out-of-body (`baml.Comparable$for$int.compare`, …); user
+/// classes carry the in-body impl method `{class_fqn}.baml.Comparable.compare`.
+/// The bound method has `receiver = v` baked in, so the VM inserts it as `self`
+/// and the comparison call only passes the `other` argument
+/// (`YieldToCall { args: [other] }`).
+///
+/// Used by the native `Sortable.sort2` (`array.rs`) to sort user-`Comparable`
+/// element types without going through the BAML-level generic dispatch.
+pub(super) fn make_compare_callee(vm: &mut BexVm, v: Value) -> Result<HeapPtr, VmRustFnError> {
+    use bex_vm_types::ValueKind;
+    let fn_name: String = match v.kind() {
+        ValueKind::Int(_) => "baml.Comparable$for$int.compare".to_string(),
+        ValueKind::Object(ptr) => match vm.get_object(ptr) {
+            Object::Float(_) => "baml.Comparable$for$float.compare".to_string(),
+            Object::String(_) => "baml.Comparable$for$string.compare".to_string(),
+            Object::Bigint(_) => "baml.Comparable$for$bigint.compare".to_string(),
+            Object::Instance(inst) => {
+                let class_ptr = inst.class;
+                let fqn = match vm.get_object(class_ptr) {
+                    Object::Class(c) => c.name.render_dotted(false),
+                    _ => {
+                        return Err(VmRustFnError::InternalError(
+                            VmInternalError::MissingNativeFunction {
+                                name: "compare dispatch: instance.class is not a Class".to_string(),
+                            },
+                        ));
+                    }
+                };
+                format!("{fqn}.baml.Comparable.compare")
+            }
+            _ => {
+                return Err(VmRustFnError::BamlError(VmBamlError::InvalidArgument {
+                    message: "array.sort: element type does not implement Comparable".to_string(),
+                }));
+            }
+        },
+        _ => {
+            return Err(VmRustFnError::BamlError(VmBamlError::InvalidArgument {
+                message: "array.sort: element type does not implement Comparable".to_string(),
+            }));
+        }
+    };
+
+    let fn_ptr = vm.find_function_by_name(&fn_name).ok_or_else(|| {
+        VmRustFnError::InternalError(VmInternalError::MissingNativeFunction {
+            name: format!("compare dispatch: function '{fn_name}' not found in globals"),
+        })
+    })?;
+
+    Ok(vm.alloc_bound_method(bex_vm_types::BoundMethod {
+        function: fn_ptr,
+        receiver: v,
+    }))
+}
+
 // =============================================================================
 // Public module-level function wrappers
 //
@@ -231,6 +289,16 @@ pub fn attach_builtins(object: Object) -> Result<Object, VmInternalError> {
                     // from other stdlib packages (assert, testing, …) are deferred.
                     if !function.name.starts_with("baml.") {
                         bex_vm_types::FunctionKind::NativeUnresolved
+                    } else if function.name.as_str() == "baml.Sortable$for$T[].sort" {
+                        // The `Sortable` blanket impl's `sort2` is implemented
+                        // natively (`array::sort_comparable_native`): it
+                        // dispatches each element's `compare` by runtime type.
+                        // The generated `get_native_fn` table is keyed on
+                        // class/namespace and cannot name a blanket-impl method
+                        // on `T[]`, so wire it up here.
+                        bex_vm_types::FunctionKind::Native(
+                            (array::sort_comparable_native as NativeFunction) as *const (),
+                        )
                     } else {
                         let Some(native_function) =
                             PackageBamlImpl::get_native_fn(function.name.as_str())

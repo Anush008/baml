@@ -87,17 +87,13 @@ class Array<T> {
     $rust_function
   }
 
-  /// Sorts this array in place using natural ascending order, then returns `self`.
-  ///
-  /// Natural ordering supports ints, floats, bigints, strings, and supported
-  /// int/float or int/bigint mixes. Nulls, NaN, and non-orderable values throw
-  /// `InvalidArgument`.
-  //baml:mut_vm
-  //baml:may_yield
-  //baml:mut_self
-  function sort(self) -> T[] throws root.errors.InvalidArgument {
-    $rust_function
-  }
+  // `sort()` is no longer a method of `Array<T>`: it is provided by the
+  // `Sortable` interface (`baml/comparable.baml`), blanket-implemented for
+  // `T[]` where `T implements Comparable`. This makes `sort()` reject
+  // non-orderable element types at compile time (with a `sort_by` pointer)
+  // and infallible (`throws never`) for `int`/`bigint`/`string`, instead of
+  // the old unconditional `throws InvalidArgument`. `sort_by`/`sort_by_key`
+  // remain here.
 
   /// Sorts this array in place using a comparator, then returns `self`.
   ///

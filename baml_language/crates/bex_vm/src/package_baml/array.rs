@@ -4,7 +4,10 @@ use bex_heap::TlabHolder;
 use bex_vm_types::{HeapPtr, Object, ObjectType, types::Value};
 use num_bigint::BigInt;
 
-use super::{BamlClassArray, Continuation, NativeCallResult, PackageBamlImpl, make_to_json_callee};
+use super::{
+    BamlClassArray, Continuation, NativeCallResult, PackageBamlImpl, make_compare_callee,
+    make_to_json_callee,
+};
 use crate::{
     BexVm,
     errors::{VmBamlError, VmInternalError, VmRustFnError},
@@ -713,6 +716,159 @@ impl Continuation for SortByContinuation {
     }
 }
 
+// ─── Sortable.sort2 (Comparable) native implementation ──────────────────────
+//
+// The `Sortable` blanket impl (`implements<T extends Comparable> Sortable for
+// T[]`) sorts by each element's `Comparable.compare`. Primitive-domain arrays
+// take the native natural-order fast path (`sort_values_natural`, which also
+// enforces the NaN rejection that float's `CmpError = InvalidArgument`
+// promises). Other element types — user classes implementing `Comparable` —
+// go through a stable insertion sort that dispatches `compare` per pair by the
+// element's runtime type, mirroring `sort_by` but building the comparator
+// callee natively (the BAML-level generic interface dispatch does not survive
+// being routed through a higher-order native callback).
+
+/// True if `v` is a primitive whose natural order the native fast path covers
+/// (int / float / bigint / string). Instances and everything else go through
+/// per-element `compare` dispatch.
+fn is_natural_primitive(vm: &BexVm, v: Value) -> bool {
+    if v.as_int().is_some() {
+        return true;
+    }
+    match v.as_object_ptr() {
+        Some(ptr) => matches!(
+            vm.get_object(ptr),
+            Object::Float(_) | Object::Bigint(_) | Object::String(_)
+        ),
+        None => false,
+    }
+}
+
+/// Stable insertion sort dispatching `Comparable.compare` per pair. Mirrors
+/// `SortByContinuation` but rebuilds the comparator callee from the current
+/// element's runtime type for each comparison. Write-back is deferred until the
+/// whole sort finishes, so a `compare` that throws leaves the array untouched
+/// (rollback parity with `sort_by`).
+struct ComparableSortContinuation {
+    receiver: Value,
+    items: Vec<Value>,
+    next_idx: usize,
+    sorted: Vec<Value>,
+    insert_idx: usize,
+    current: Value,
+}
+
+impl ComparableSortContinuation {
+    fn advance_or_finish(mut self: Box<Self>, vm: &mut BexVm) -> NativeCallResult {
+        if self.next_idx >= self.items.len() {
+            return write_back_array_result(vm, self.receiver, self.sorted);
+        }
+        self.current = self.items[self.next_idx];
+        self.next_idx += 1;
+        self.insert_idx = 0;
+        self.yield_compare(vm)
+    }
+
+    fn yield_compare(self: Box<Self>, vm: &mut BexVm) -> NativeCallResult {
+        let callee = match make_compare_callee(vm, self.current) {
+            Ok(ptr) => ptr,
+            Err(e) => return NativeCallResult::Error(e),
+        };
+        let other = self.sorted[self.insert_idx];
+        NativeCallResult::YieldToCall {
+            callee,
+            args: vec![other],
+            type_args: vec![],
+            continuation: self,
+        }
+    }
+}
+
+impl Continuation for ComparableSortContinuation {
+    fn call(mut self: Box<Self>, vm: &mut BexVm, value: Value) -> NativeCallResult {
+        let cmp = match expect_int(vm, value) {
+            Ok(i) => i,
+            Err(e) => return e,
+        };
+        if cmp < 0 {
+            self.sorted.insert(self.insert_idx, self.current);
+            return self.advance_or_finish(vm);
+        }
+        self.insert_idx += 1;
+        if self.insert_idx >= self.sorted.len() {
+            self.sorted.push(self.current);
+            return self.advance_or_finish(vm);
+        }
+        self.yield_compare(vm)
+    }
+
+    fn gc_roots(&self) -> Vec<HeapPtr> {
+        let mut roots = Vec::new();
+        collect_value_roots(&[self.receiver, self.current], &mut roots);
+        collect_value_roots(&self.items, &mut roots);
+        collect_value_roots(&self.sorted, &mut roots);
+        roots
+    }
+
+    fn apply_forwarding(&mut self, forwarding: &HashMap<HeapPtr, HeapPtr>) {
+        forward_values(std::slice::from_mut(&mut self.receiver), forwarding);
+        forward_values(std::slice::from_mut(&mut self.current), forwarding);
+        forward_values(&mut self.items, forwarding);
+        forward_values(&mut self.sorted, forwarding);
+    }
+}
+
+/// Native entry point for `baml.Sortable$for$T[].sort2`. The blanket impl is
+/// generic in `T`, so the value-arg list is `[<T type arg>, self]` — the array
+/// receiver (`self`, the only value parameter) is the lone array among the
+/// args, after any leading type-argument values.
+pub(super) fn sort_comparable_native(vm: &mut BexVm, args: &[Value]) -> NativeCallResult {
+    let receiver = args.iter().copied().find(|v| {
+        v.as_object_ptr()
+            .is_some_and(|p| matches!(vm.get_object(p), Object::Array(_)))
+    });
+    let Some(receiver) = receiver else {
+        return NativeCallResult::Error(
+            VmBamlError::InvalidArgument {
+                message: "array.sort: missing array receiver".to_string(),
+            }
+            .into(),
+        );
+    };
+    let items = match vm.as_array(&receiver) {
+        Ok(array) => array.to_vec(),
+        Err(e) => return NativeCallResult::Error(e.into()),
+    };
+    if items.len() <= 1 {
+        return write_back_array_result(vm, receiver, items);
+    }
+
+    // Fast path: primitive natural-order domains (int / float / bigint /
+    // string). `sort_values_natural` validates the whole array and throws
+    // `InvalidArgument` on NaN — preserving float's `CmpError` contract.
+    if is_natural_primitive(vm, items[0]) {
+        let mut values = items;
+        if let Err(e) = sort_values_natural(vm, "array.sort", &mut values) {
+            return NativeCallResult::Error(e);
+        }
+        return write_back_array_result(vm, receiver, values);
+    }
+
+    // Slow path: user `Comparable` types — stable insertion sort dispatching
+    // each element's `compare`.
+    let first_sorted = items[0];
+    let first_current = items[1];
+    let cont = Box::new(ComparableSortContinuation {
+        receiver,
+        items,
+        next_idx: 2,
+        sorted: vec![first_sorted],
+        insert_idx: 0,
+        current: first_current,
+    });
+    cont.yield_compare(vm)
+}
+
 // ─── Array.sort_by_key continuation ─────────────────────────────────────────
 
 struct SortByKeyContinuation {
@@ -802,17 +958,6 @@ impl BamlClassArray for PackageBamlImpl {
         let mut result = array.to_vec();
         result.reverse();
         result
-    }
-
-    fn sort(vm: &mut BexVm, array: &Value) -> NativeCallResult {
-        let mut values = match vm.as_array(array) {
-            Ok(array) => array.to_vec(),
-            Err(e) => return NativeCallResult::Error(e.into()),
-        };
-        if let Err(e) = sort_values_natural(vm, "array.sort", &mut values) {
-            return NativeCallResult::Error(e);
-        }
-        write_back_array_result(vm, *array, values)
     }
 
     fn sort_by(vm: &mut BexVm, array: &Value, compare: &Value) -> NativeCallResult {

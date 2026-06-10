@@ -8686,17 +8686,19 @@ impl<'db> LoweringContext<'db> {
                 method,
             )
         {
+            // A concrete non-class receiver (e.g. `int[]`, `map<string, T>`)
+            // statically pins exactly one implementor of `method` — there is
+            // nothing to discriminate at runtime. Return that single candidate
+            // so dispatch lowers to an unconditional call: this is both an
+            // optimization and a correctness fix, since a container receiver's
+            // `Type` guard (`int[]`) has no representable `IsType` form and
+            // would otherwise always fail and hit the `unreachable` arm.
             let runtime_ty = self.convert_tir_ty_for_runtime(recv_tir_ty);
-            if !resolved.iter().any(|candidate| {
-                matches!(&candidate.guard, InterfaceDispatchGuard::Type(ty) if *ty == runtime_ty)
-                    && candidate.item_ref == item_ref
-            }) {
-                resolved.push(InterfaceMethodCandidate {
-                    guard: InterfaceDispatchGuard::Type(runtime_ty),
-                    item_ref,
-                    frame_seed: CalleeFrameSeed::Static(frame_type_args),
-                });
-            }
+            return vec![InterfaceMethodCandidate {
+                guard: InterfaceDispatchGuard::Type(runtime_ty),
+                item_ref,
+                frame_seed: CalleeFrameSeed::Static(frame_type_args),
+            }];
         }
         resolved
     }
@@ -8728,6 +8730,14 @@ impl<'db> LoweringContext<'db> {
         let bb_join = self.builder.create_block();
         let bb_otherwise = self.builder.create_block();
 
+        // A single candidate means the static receiver type admits exactly one
+        // implementor, so it provably matches at runtime and the guard is
+        // redundant. Skipping it also handles concrete container receivers
+        // (e.g. `int[]` dispatched through a blanket `implements ... for T[]`),
+        // whose `IsType` guard has no representable form and would otherwise
+        // always fail and fall to the `unreachable` arm.
+        let single_candidate = resolved.len() == 1;
+
         let mut next_check = bb_entry;
         for (idx, candidate) in resolved.iter().enumerate() {
             let bb_body = self.builder.create_block();
@@ -8738,12 +8748,16 @@ impl<'db> LoweringContext<'db> {
             };
 
             self.builder.set_current_block(next_check);
-            self.emit_interface_dispatch_guard_branch(
-                recv_local,
-                &candidate.guard,
-                bb_body,
-                bb_next,
-            );
+            if single_candidate {
+                self.builder.goto(bb_body);
+            } else {
+                self.emit_interface_dispatch_guard_branch(
+                    recv_local,
+                    &candidate.guard,
+                    bb_body,
+                    bb_next,
+                );
+            }
             self.builder.set_current_block(bb_body);
             // Seed the callee frame's `type_args` so a dispatched method that
             // reads its enclosing `T` at runtime — e.g. building `Other<T>{}` or
@@ -8971,6 +8985,11 @@ impl<'db> LoweringContext<'db> {
         let bb_join = self.builder.create_block();
         let bb_otherwise = self.builder.create_block();
 
+        // See `emit_method_candidate_switch`: a single candidate provably
+        // matches, so the guard is redundant (and unrepresentable for some
+        // concrete container receiver types).
+        let single_candidate = resolved.len() == 1;
+
         let mut next_check = bb_entry;
         for (idx, candidate) in resolved.iter().enumerate() {
             let bb_body = self.builder.create_block();
@@ -8981,12 +9000,16 @@ impl<'db> LoweringContext<'db> {
             };
 
             self.builder.set_current_block(next_check);
-            self.emit_interface_dispatch_guard_branch(
-                recv_local,
-                &candidate.guard,
-                bb_body,
-                bb_next,
-            );
+            if single_candidate {
+                self.builder.goto(bb_body);
+            } else {
+                self.emit_interface_dispatch_guard_branch(
+                    recv_local,
+                    &candidate.guard,
+                    bb_body,
+                    bb_next,
+                );
+            }
             self.builder.set_current_block(bb_body);
             self.builder.assign(
                 dest.clone(),

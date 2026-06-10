@@ -89,46 +89,35 @@ test "array_sort_bigints" {
     assert.is_true(baml.deep_equals(xs, expected))
 }
 
-test "array_sort_mixed_int_float" {
-    let xs: (int | float)[] = [2.5, 1, 2];
-    xs.sort();
-    let expected: (int | float)[] = [1, 2, 2.5];
+test "array_sort_floats" {
+    let xs = [2.5, 0.5, 1.5];
+    let result = xs.sort();
+    let expected = [0.5, 1.5, 2.5];
+    assert.is_true(result == xs);
     assert.is_true(baml.deep_equals(xs, expected))
 }
 
-test "array_sort_rejects_null" {
-    {
-        let xs: int?[] = [1, null, 2];
+// PHASE-5 cutover: `sort()` is now the `Sortable` blanket method requiring
+// `T implements Comparable`. The previously-runtime rejections below became
+// compile errors and moved to Rust `assert_compile_error_*` tests in
+// `tests/comparable_sort.rs` (`phase5_*`):
+//   • `(int | float)[].sort()` — unions can't implement `Comparable`
+//   • `(float | bigint)[].sort()` — likewise
+//   • `int?[].sort()` (optional = union)
+//   • `ArraySortItem[].sort()` (class without a `Comparable` impl)
+//   • `(int | string)[].sort()` — rollback now pinned via `sort_by`
+//     (`array_sort_by_callback_throws`)
+// `NaN` stays a *runtime* error: `float` binds `type CmpError = InvalidArgument`
+// and `compare` throws on NaN, so `float[].sort()` still rejects NaN at runtime.
+test "array_sort_rejects_nan" {
+    let msg = {
+        let xs = [1.0, float.nan()];
         xs.sort();
-        baml.sys.panic("expected sort to throw")
+        "no throw"
     } catch (e) {
-        baml.errors.InvalidArgument => null
-    }
-}
-
-test "array_sort_rejects_class_instances" {
-    {
-        let xs = [
-            ArraySortItem { key: 2, label: "b", nullable: 2 },
-            ArraySortItem { key: 1, label: "a", nullable: 1 }
-        ];
-        xs.sort();
-        baml.sys.panic("expected sort to throw")
-    } catch (e) {
-        baml.errors.InvalidArgument => null
-    }
-}
-
-test "array_sort_failure_does_not_write_back" {
-    let xs: (int | string)[] = [2, "x", 1];
-    {
-        xs.sort();
-        baml.sys.panic("expected sort to throw")
-    } catch (e) {
-        baml.errors.InvalidArgument => null
-    }
-    let expected: (int | string)[] = [2, "x", 1];
-    assert.is_true(baml.deep_equals(xs, expected))
+        baml.errors.InvalidArgument => e.message
+    };
+    assert.is_true(msg.matches("NaN"))
 }
 
 // ─── sort_by ─────────────────────────────────────────────────────────────────
